@@ -610,6 +610,67 @@ namespace MatchZy
             }
         }
 
+        [ConsoleCommand("css_forcewin", "Ends the map being played with the given team as its winner: css_forcewin <team1|team2>")]
+        public void OnForceWinCommand(CCSPlayerController? player, CommandInfo command)
+        {
+            // css_endmatch and css_restart both reset the whole loaded series; nothing
+            // ended one map of it with a chosen winner short of the .gg vote, which needs
+            // a player on the losing team. This is that path for an admin or an RCON
+            // caller: set the scores so the winner is ahead and let HandleMatchEnd run
+            // the series score, the clinch, the demo and the map change exactly as it
+            // does for a map that was played out.
+            if (!IsPlayerAdmin(player, "css_forcewin", "@css/config"))
+            {
+                SendPlayerNotAdminMessage(player);
+                return;
+            }
+
+            string arg = command.ArgByIndex(1).Trim().ToLowerInvariant();
+            Team? winner = arg switch
+            {
+                "team1" => matchzyTeam1,
+                "team2" => matchzyTeam2,
+                _ => null,
+            };
+            if (winner == null)
+            {
+                command.ReplyToCommand($"{chatPrefix} Usage: css_forcewin <team1|team2>");
+                return;
+            }
+            if (!isMatchSetup || !isMatchLive)
+            {
+                command.ReplyToCommand($"{chatPrefix} No map is live to award. css_forcewin ends the map being played; use css_endmatch to drop the whole match.");
+                return;
+            }
+
+            Team loser = winner == matchzyTeam1 ? matchzyTeam2 : matchzyTeam1;
+            (int t1score, int t2score) = GetTeamsScore();
+            int winnerScore = winner == matchzyTeam1 ? t1score : t2score;
+            int loserScore = winner == matchzyTeam1 ? t2score : t1score;
+
+            // The rounds stay as played wherever they already name the winner. Otherwise
+            // the winner is put one round ahead -- the smallest change that makes
+            // HandleMatchEnd, which reads the winner off the score, agree with the admin.
+            if (winnerScore <= loserScore)
+            {
+                string winnerSide = teamSides[winner];
+                foreach (var team in Utilities.FindAllEntitiesByDesignerName<CCSTeam>("cs_team_manager"))
+                {
+                    if (team.Teamname == winnerSide)
+                    {
+                        team.Score = loserScore + 1;
+                    }
+                }
+                winnerScore = loserScore + 1;
+            }
+
+            Log($"[ForceWin] Map {matchConfig.CurrentMapNumber} awarded to {winner.teamName} over {loser.teamName} by {(player == null ? "console" : player.PlayerName)}; score recorded as {winnerScore}-{loserScore}.");
+            PrintToAllChat($"{ChatColors.Green}{winner.teamName}{ChatColors.Default} has been awarded this map by an admin.");
+            command.ReplyToCommand($"{chatPrefix} Map awarded to {winner.teamName} ({winnerScore}-{loserScore}).");
+
+            HandleMatchEnd();
+        }
+
         [ConsoleCommand("css_map", "Changes the map using changelevel")]
         public void OnChangeMapCommand(CCSPlayerController? player, CommandInfo command)
         {

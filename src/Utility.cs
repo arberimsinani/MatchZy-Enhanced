@@ -2154,6 +2154,7 @@ namespace MatchZy
             // This ensures that the mp_match_restart_delay is not shorter than what is required for the GOTV recording to finish.
             // Ref: Get5
             int restartDelay = ConVar.Find("mp_match_restart_delay")!.GetPrimitiveValue<int>();
+            int configuredRestartDelay = restartDelay;
             int tvDelay = GetTvDelay();
             int tvFlushDelay;
             bool hasUploadEndpoint = !string.IsNullOrEmpty(demoUploadURL);
@@ -2189,13 +2190,26 @@ namespace MatchZy
                 }
                 if (requiredDelay > restartDelay)
                 {
-                    Log($"Extended mp_match_restart_delay from {restartDelay} to {requiredDelay} to ensure GOTV broadcast can finish.");
-                    ConVar.Find("mp_match_restart_delay")!.SetValue(requiredDelay);
                     restartDelay = requiredDelay;
                 }
                 Log($"[HandleMatchEnd] Demo recording enabled with upload URL - using full delay for upload");
             }
-            
+
+            // The game runs its own countdown on mp_match_restart_delay and acts when it
+            // expires: with mp_match_end_restart 0 it loads the next map of the map group,
+            // with 1 it restarts the map. The map change scheduled below lands at
+            // restartDelay - 1, so the cvar must never be shorter than restartDelay,
+            // whichever branch above chose it. Upstream only ever extended the cvar, so
+            // this held by construction; the branches above can pick a delay the cvar does
+            // not cover -- recording with no upload URL waited tv_delay + 25 s against the
+            // game's 25 s default -- and the game changed level first, with the demo still
+            // being written.
+            if (restartDelay > configuredRestartDelay)
+            {
+                Log($"Extended mp_match_restart_delay from {configuredRestartDelay} to {restartDelay} so the game does not change level before MatchZy does.");
+                ConVar.Find("mp_match_restart_delay")!.SetValue(restartDelay);
+            }
+
             int currentMapNumber = matchConfig.CurrentMapNumber;
             Log($"[HandleMatchEnd] MAP ENDED, isMatchSetup: {isMatchSetup} matchid: {liveMatchId} currentMapNumber: {currentMapNumber} tvFlushDelay: {tvFlushDelay} demoRecording: {isDemoRecordingEnabled} uploadURL: {hasUploadEndpoint}");
 

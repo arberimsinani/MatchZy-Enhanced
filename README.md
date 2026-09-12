@@ -86,3 +86,20 @@ Built with [CounterStrikeSharp](https://github.com/roflmuffin/CounterStrikeSharp
 <strong>Made with ❤️ for the CS2 community</strong>
 
 </div>
+
+## Changes in this fork
+
+This is [cs2-xpbot](https://github.com/arberimsinani/cs2-xpbot)'s fork of
+MatchZy-Enhanced. It tracks upstream `dev`; the branch `xpbot` carries the
+changes below on top, each written to be offered upstream.
+
+- **The game can no longer change map before MatchZy does.** `HandleMatchEnd`
+  raises `mp_match_restart_delay` to cover the delay it chose in every branch,
+  not only when a demo upload URL is configured. Before this, a server
+  recording without an upload URL waited `tv_delay + 25` s against the game's
+  25 s default, and the game loaded the next map of the map group first, with
+  the demo still being written.
+- **`css_forcewin <team1|team2>`** ends the map being played with the given
+  team as its winner and lets the normal match-end path run: series score,
+  clinch, demo and map change. `css_endmatch` drops the whole loaded series;
+  this ends one map of it. Admin or console/RCON only; needs a live map.
