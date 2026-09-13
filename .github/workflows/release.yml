@@ -43,4 +43,10 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
+          # release.sh makes the Discord announcement mandatory so a release is
+          # never quietly unannounced, and a repository with no webhook secret
+          # therefore cannot release at all -- the preflight exits before the
+          # version bump. Skip the announcement only when the secret is absent;
+          # setting it turns announcements back on with no change here.
+          SKIP_DISCORD_WEBHOOK: ${{ secrets.DISCORD_WEBHOOK_URL == '' && '1' || '' }}
         run: echo "y" | bash ./release.sh "${{ github.event.inputs.bump_type }}"
