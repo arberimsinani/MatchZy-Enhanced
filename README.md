@@ -47,6 +47,112 @@ Built for **[MatchZy Auto Tournament](https://github.com/sivert-io/matchzy-auto-
 - 📊 **Server tracking** with health monitoring and status events
 - 💾 **Pull API** for direct match stats retrieval
 
+### Queued match loads
+
+`matchzy_loadmatch_url` (and `matchzy match load`) sent while the current series is in postgame does not load right away. The match is queued and loads after the series resets. The reply ends with `queued_match=<id>`, where `<id>` is the config file name without its extension (for `/api/matches/r2m1.json` that is `r2m1`), and the `matchzy_tournament_next_match` convar holds the same id. Sending another URL while one is queued replaces it.
+
+The queued match is loaded only by the automatic reset after a series ends. It is dropped when:
+
+- `css_restart` or `css_endmatch` resets the server. The reply includes `cleared_queued_match=<id>`.
+- `matchzy_clear_queued_match` is run. This is server console / RCON only. The reply is `cleared_queued_match=<id>`, or `cleared_queued_match=none` when nothing was queued.
+
+### Bootstrap config
+
+A controller such as MatchZy Auto Tournament points a server at its bootstrap endpoint with two
+server console / RCON commands:
+
+```
+matchzy_bootstrap_token "<token>"
+matchzy_bootstrap_url "http://<controller>/api/servers/<server_id>/bootstrap"
+```
+
+The plugin then fetches that URL (token sent as `X-MatchZy-Token`) and runs the commands in the
+payload. It fetches **about 1.5 seconds after the last change** to either value, not the moment
+one of them is set: every change restarts the timer, and the fetch uses the URL and token current
+when it fires. The two commands can be sent in either order and result in one fetch. On startup
+the persisted URL and token are fetched straight away.
+
+If the payload sets a `matchzy_server_id` that differs from the id in the bootstrap URL, or from
+the id the server already had, a `[Bootstrap] WARNING` is logged. The payload is still applied.
+This usually means the bootstrap URL is stale.
+
+### Multi-server setups sharing one database
+
+Several servers can point at the same MySQL database. That is the point of a shared stats
+database, and it now works for persistent config too.
+
+Everything MatchZy persists — the `matchzy_server_config` table and the event retry queue — is
+stored against an identity for the server that wrote it, so one server can no longer overwrite
+another's values. Before this, whichever server wrote last won, and on restart every server on the
+box loaded that one server's `matchzy_server_id`, bootstrap URL and remote log settings.
+
+**The settings that are now per server**, i.e. each server keeps its own value:
+
+- `matchzy_server_id`
+- `matchzy_bootstrap_url`, `matchzy_bootstrap_token`
+- `matchzy_remote_log_url`, `matchzy_remote_log_header_key`, `matchzy_remote_log_header_value`
+- `matchzy_webhook_url`, `matchzy_heartbeat_url`
+- `matchzy_report_endpoint`, `matchzy_report_token`, `matchzy_match_token`
+- `matchzy_demo_upload_url`
+- `matchzy_admins_url`, `matchzy_admins_refresh_seconds`
+- `matchzy_chat_prefix`, `matchzy_admin_chat_prefix`
+- all `matchzy_warmup_*` settings
+
+The chat prefixes and the warmup settings are usually the same on every server, but they are
+scoped the same way as the rest: one shared row for them was only ever an accident of the old
+storage, and "last writer wins" is not a useful way to share a value. Set them per server, or
+leave the existing shared value in place (see backwards compatibility below).
+
+Genuinely global data — match, map and player stats in `matchzy_stats_*` — is untouched and stays
+shared, which is why you point several servers at one database in the first place.
+
+**How a server identifies itself.** The identity is derived from the bind address and the game
+port, e.g. `cs2:27015`, `cs2:27025`, `cs2:27035` for three servers on a box named `cs2`. The bind
+address is used when it names a real interface; CS2 servers are nearly always started with
+`-ip 0.0.0.0`, which identifies nothing, so the machine name is used instead. Nothing has to be
+configured for this to work, including before a controller like MAT has ever talked to the server.
+
+Two things change a server's identity: changing its game port, and renaming the box. Neither
+loses data — the server simply finds no row of its own and falls back to the shared pre-upgrade
+row, and a controller re-pushes its values on the next configure. To pin a name that survives
+both, set an explicit scope:
+
+```
+# in the server's start arguments (reliable: config.cfg may not have executed yet)
++matchzy_config_scope tournament-eu-3
+```
+
+`matchzy_config_scope` can also go in `config.cfg`, but the start-argument form is the one to
+prefer and wins when both are set. It is never persisted to the database — a value that decides
+which rows you read cannot itself be read from those rows.
+
+The resolved scope is logged once at startup, e.g.
+`[ConfigScope] Using scope 'cs2-server-2' (from start argument)`. The order is: the
+`+matchzy_config_scope` start argument, the `matchzy_config_scope` convar, `-port` in the start
+arguments, then the `hostport` convar once the server has activated. Start arguments are read from
+`/proc/self/cmdline` on Linux. If none of these identify the server, MatchZy uses a key derived
+from the server's install path (still distinct per server, never a key shared by the whole box)
+and logs a warning — add `+matchzy_config_scope` when you see it.
+
+**Upgrading from 1.4.26.** 1.4.26 could not read the start arguments inside the game process and
+resolved every server on a box to the same `<host>:27015` scope, so those rows hold whichever
+server wrote last. They are left in place but no longer read by any server that resolves a
+different scope (reads only ever fall back to the pre-scoping shared row, never to another
+scope). A controller re-pushes the correct values on the next configure. Once every server logs
+its own scope you can remove the stale rows, e.g.
+`DELETE FROM matchzy_server_config WHERE server_scope = 'cs2:27015';` — but only if no server on
+that box legitimately resolves to that scope (a server without `+matchzy_config_scope` on port
+27015 does).
+
+**Backwards compatibility.** Rows written before this change are kept and treated as shared
+fallbacks. A server reads its own row when it has one and the shared row otherwise, and only ever
+writes its own row. So one server per database keeps working with no operator action, and a
+multi-server setup keeps its current behaviour until each server writes its own values. The
+schema migration runs automatically on startup and is a no-op once applied.
+
+If you worked around this by moving servers to per-server SQLite files, you can move them back to
+the shared MySQL database.
+
 ### Player Features
 - 🚀 **Auto-ready system** — Instant match starts (optional)
 - ⏸️ **Enhanced pauses** — Team limits, timeouts, dual unpause
