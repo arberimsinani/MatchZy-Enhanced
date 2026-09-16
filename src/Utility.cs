@@ -493,12 +493,12 @@ namespace MatchZy
         {
             try
             {
-                tournamentStatus.Value = status;
+                // Idle states never carry a match: MAT treats "idle" / "warmup with no match"
+                // as free, so a stale match id here keeps the server busy forever.
+                bool hasActiveMatch = TournamentStatusLogic.HasActiveMatch(isMatchSetup, tournamentStatus.Value, status);
 
-                if (!string.IsNullOrEmpty(matchSlug))
-                {
-                    tournamentMatch.Value = matchSlug;
-                }
+                tournamentStatus.Value = status;
+                tournamentMatch.Value = TournamentStatusLogic.ResolveMatchValue(status, matchSlug, tournamentMatch.Value, hasActiveMatch);
 
                 // Update timestamp to current Unix time
                 long timestamp = DateTimeOffset.UtcNow.ToUnixTimeSeconds();
@@ -1234,8 +1234,23 @@ namespace MatchZy
             return (count, totalHealth);
         }
 
-        private void ResetMatch(bool warmupCfgRequired = true)
+        /// <param name="loadQueuedMatch">
+        /// True only for the automatic reset after a series ended normally: a match queued
+        /// during postgame is then loaded. Every other reset (css_restart, css_endmatch,
+        /// load failures, leaving practice) is an operator or error reset, and loading a
+        /// match queued before it would resurrect an allocation the caller may already
+        /// have moved elsewhere, so the queue is dropped.
+        /// </param>
+        private void ResetMatch(bool warmupCfgRequired = true, bool loadQueuedMatch = false)
         {
+            if (!loadQueuedMatch)
+            {
+                ClearQueuedMatch("match reset");
+            }
+
+            // Covers the post-series reset, css_restart and css_endmatch.
+            RestoreMatchRestartDelay("match reset");
+
             try
             {
                 // We stop demo recording if a live match was restarted
@@ -1375,6 +1390,9 @@ namespace MatchZy
 
                 // Clear any queued next-match identifier when performing a full reset.
                 tournamentNextMatch.Value = "";
+                // The previous match config is no longer loaded. The match report falls back
+                // to it for the match slug, so it must not outlive the match.
+                loadedConfigFile = "";
 
                 if (warmupCfgRequired)
                 {
@@ -2153,61 +2171,32 @@ namespace MatchZy
 
             // This ensures that the mp_match_restart_delay is not shorter than what is required for the GOTV recording to finish.
             // Ref: Get5
-            int restartDelay = ConVar.Find("mp_match_restart_delay")!.GetPrimitiveValue<int>();
-            int configuredRestartDelay = restartDelay;
+            // The raise is computed per map from the operator's original value and the current
+            // tv_delay, and undone on reset, so one long-delay match no longer leaks into later ones.
+            int currentRestartDelay = ConVar.Find("mp_match_restart_delay")!.GetPrimitiveValue<int>();
             int tvDelay = GetTvDelay();
-            int tvFlushDelay;
             bool hasUploadEndpoint = !string.IsNullOrEmpty(demoUploadURL);
-            
-            // Smart delay calculation based on demo recording and upload configuration
+            MatchEndDelays delays = matchRestartDelay.Compute(currentRestartDelay, tvDelay, isDemoRecordingEnabled, hasUploadEndpoint);
+            int restartDelay = delays.RestartDelay;
+            int tvFlushDelay = delays.TvFlushDelay;
+
+            if (delays.CvarToSet is int newRestartDelay)
+            {
+                Log($"Set mp_match_restart_delay from {currentRestartDelay} to {newRestartDelay} for tv_delay {tvDelay} (original: {matchRestartDelay.OriginalDelay}) to ensure GOTV broadcast can finish.");
+                ConVar.Find("mp_match_restart_delay")!.SetValue(newRestartDelay);
+            }
+
             if (!isDemoRecordingEnabled)
             {
-                // Demo recording disabled - very fast restart
-                restartDelay = 10;
-                tvFlushDelay = 0;
                 Log($"[HandleMatchEnd] Demo recording disabled - using fast restart delay of {restartDelay}s");
             }
             else if (!hasUploadEndpoint)
             {
-                // Demo recording enabled but no upload URL - only wait for GOTV flush (no upload)
-                int requiredDelay = tvDelay + 15;
-                tvFlushDelay = requiredDelay;
-                if (tvDelay > 0.0)
-                {
-                    requiredDelay += 10;
-                }
-                restartDelay = requiredDelay;
                 Log($"[HandleMatchEnd] Demo recording enabled, no upload URL - using GOTV flush delay of {restartDelay}s (no upload wait)");
             }
             else
             {
-                // Demo recording enabled with upload URL - wait for full GOTV flush and upload
-                int requiredDelay = tvDelay + 15;
-                tvFlushDelay = requiredDelay;
-                if (tvDelay > 0.0)
-                {
-                    requiredDelay += 10;
-                }
-                if (requiredDelay > restartDelay)
-                {
-                    restartDelay = requiredDelay;
-                }
-                Log($"[HandleMatchEnd] Demo recording enabled with upload URL - using full delay for upload");
-            }
-
-            // The game runs its own countdown on mp_match_restart_delay and acts when it
-            // expires: with mp_match_end_restart 0 it loads the next map of the map group,
-            // with 1 it restarts the map. The map change scheduled below lands at
-            // restartDelay - 1, so the cvar must never be shorter than restartDelay,
-            // whichever branch above chose it. Upstream only ever extended the cvar, so
-            // this held by construction; the branches above can pick a delay the cvar does
-            // not cover -- recording with no upload URL waited tv_delay + 25 s against the
-            // game's 25 s default -- and the game changed level first, with the demo still
-            // being written.
-            if (restartDelay > configuredRestartDelay)
-            {
-                Log($"Extended mp_match_restart_delay from {configuredRestartDelay} to {restartDelay} so the game does not change level before MatchZy does.");
-                ConVar.Find("mp_match_restart_delay")!.SetValue(restartDelay);
+                Log($"[HandleMatchEnd] Demo recording enabled with upload URL - using restart delay of {restartDelay}s (tv_delay {tvDelay})");
             }
 
             int currentMapNumber = matchConfig.CurrentMapNumber;
@@ -2218,7 +2207,7 @@ namespace MatchZy
                 StopDemoRecording(tvFlushDelay - 0.5f, activeDemoFile, liveMatchId, currentMapNumber);
             }
 
-            string winnerName = GetMatchWinnerName();
+            (string winnerName, string winnerSlot) = GetMatchWinner();
             (int t1score, int t2score) = GetTeamsScore();
             int team1SeriesScore = matchzyTeam1.seriesScore;
             int team2SeriesScore = matchzyTeam2.seriesScore;
@@ -2237,7 +2226,10 @@ namespace MatchZy
             {
                 MatchId = liveMatchId,
                 MapNumber = currentMapNumber,
-                Winner = new Winner(t1score > t2score && reverseTeamSides["CT"] == matchzyTeam1 ? "3" : "2", t1score > t2score ? "team1" : "team2"),
+                // Winner comes from the resolved map winner (score, then damage tiebreak),
+                // never from a raw score comparison: a tied map used to fall through to
+                // "team2" even when the tiebreak had picked team1.
+                Winner = new Winner(MatchLogic.SideNumberForSlot(winnerSlot, teamSides[matchzyTeam1]), winnerSlot),
                 StatsTeam1 = new MatchZyStatsTeam(matchzyTeam1.id, matchzyTeam1.teamName, team1SeriesScore, t1score, 0, 0, new List<StatsPlayer>()),
                 StatsTeam2 = new MatchZyStatsTeam(matchzyTeam2.id, matchzyTeam2.teamName, team2SeriesScore, t2score, 0, 0, new List<StatsPlayer>())
             };
@@ -2258,28 +2250,15 @@ namespace MatchZy
                 return;
             }
 
-            int remainingMaps = matchConfig.NumMaps - matchzyTeam1.seriesScore - matchzyTeam2.seriesScore;
+            // Remaining maps count every played map, drawn ones included. The old
+            // formula (NumMaps - series wins) ignored draws, so after a drawn map the
+            // series never ended and the next line indexed past the map list.
+            int remainingMaps = MatchLogic.RemainingMaps(matchConfig.NumMaps, matchConfig.Maplist.Count, currentMapNumber);
             Log($"[HandleMatchEnd] MATCH ENDED, remainingMaps: {remainingMaps}, NumMaps: {matchConfig.NumMaps}, Team1SeriesScore: {matchzyTeam1.seriesScore}, Team2SeriesScore: {matchzyTeam2.seriesScore}");
-            if (matchzyTeam1.seriesScore == matchzyTeam2.seriesScore && remainingMaps <= 0)
+            if (MatchLogic.IsSeriesOver(matchConfig.NumMaps, remainingMaps, matchzyTeam1.seriesScore, matchzyTeam2.seriesScore, matchConfig.SeriesCanClinch))
             {
-                EndSeries(null, restartDelay - 1, t1score, t2score);
-            }
-            else if (matchConfig.SeriesCanClinch)
-            {
-                int mapsToWinSeries = (matchConfig.NumMaps / 2) + 1;
-                if (matchzyTeam1.seriesScore == mapsToWinSeries)
-                {
-                    EndSeries(winnerName, restartDelay - 1, t1score, t2score);
-                    return;
-                }
-                else if (matchzyTeam2.seriesScore == mapsToWinSeries)
-                {
-                    EndSeries(winnerName, restartDelay - 1, t1score, t2score);
-                    return;
-                }
-            }
-            else if (remainingMaps <= 0)
-            {
+                // EndSeries picks the winner from the series score; a tied series score
+                // (only possible with draws allowed or an even map count) ends as a draw.
                 EndSeries(winnerName, restartDelay - 1, t1score, t2score);
                 return;
             }
@@ -2296,6 +2275,13 @@ namespace MatchZy
             else
             {
                 Server.PrintToChatAll($"{chatPrefix} The series is tied at {ChatColors.Green}{matchzyTeam1.seriesScore}-{matchzyTeam2.seriesScore}{ChatColors.Default}");
+            }
+            if (currentMapNumber + 1 >= matchConfig.Maplist.Count)
+            {
+                // Defensive: never index past the map list; end the series instead.
+                Log($"[HandleMatchEnd] No map left in maplist (count {matchConfig.Maplist.Count}) after map {currentMapNumber}; ending series.");
+                EndSeries(winnerName, restartDelay - 1, t1score, t2score);
+                return;
             }
             matchConfig.CurrentMapNumber += 1;
             string nextMap = matchConfig.Maplist[matchConfig.CurrentMapNumber];
@@ -2485,143 +2471,105 @@ namespace MatchZy
             });
         }
 
-        private string GetMatchWinnerName()
+        /// <summary>
+        /// Resolves the winner of the map that just ended and credits the series
+        /// point. Returns the winner's team name ("Draw" when nobody won) and slot
+        /// ("team1" / "team2" / "none"). Every event and DB write about this map
+        /// must use this result so they agree with each other.
+        /// </summary>
+        private (string winnerName, string winnerSlot) GetMatchWinner()
         {
             (int t1score, int t2score) = GetTeamsScore();
-            if (t1score > t2score)
+            if (t1score != t2score)
+            {
+                return CreditMapWinner(MatchLogic.ResolveMapWinnerSlot(t1score, t2score, null));
+            }
+
+            // The map is tied on score. When the match config disallows draws
+            // (overtime disabled with 0 segments, or capped OT) the tie is broken by
+            // performance: damage, kills, headshot kills, utility damage, then a
+            // deterministic coin flip. A tied map is never recorded as a draw in that
+            // mode. When draws are allowed a tied map is recorded as a draw (legacy).
+            bool drawsDisallowed = MatchLogic.DrawsDisallowed(matchConfig.OvertimeMode, matchConfig.OvertimeSegments);
+            if (!drawsDisallowed)
+            {
+                Log($"[Tiebreak] Map ended tied on score (team1={t1score}, team2={t2score}) and draws are allowed; recording a draw.");
+                return ("Draw", MatchLogic.NoTeam);
+            }
+
+            (MatchLogic.TiebreakTotals team1Totals, MatchLogic.TiebreakTotals team2Totals) = GetTiebreakTotals();
+            int mapNumber = matchConfig.CurrentMapNumber;
+            (string? tiebreakSlot, string criterion) = MatchLogic.ResolveTiedMap(team1Totals, team2Totals, drawsDisallowed: true, liveMatchId, mapNumber);
+
+            if (criterion == MatchLogic.CoinFlipCriterion)
+            {
+                Log($"[Tiebreak] All performance criteria tied; deterministic coin flip (matchId={liveMatchId}, mapNumber={mapNumber}) picked {tiebreakSlot}.");
+            }
+
+            (string tiebreakName, string slot) = CreditMapWinner(MatchLogic.ResolveMapWinnerSlot(t1score, t2score, tiebreakSlot));
+            Log($"[Tiebreak] Map ended tied on score (team1={t1score}, team2={t2score}). Draws disallowed " +
+                $"(overtimeMode={matchConfig.OvertimeMode ?? "(unset)"}, overtimeSegments={matchConfig.OvertimeSegments?.ToString() ?? "(unset)"}); " +
+                $"selecting '{tiebreakName}' ({slot}) as winner by {criterion}.");
+            return (tiebreakName, slot);
+        }
+
+        private (string winnerName, string winnerSlot) CreditMapWinner(string slot)
+        {
+            if (slot == MatchLogic.Team1)
             {
                 matchzyTeam1.seriesScore++;
-                return matchzyTeam1.teamName;
+                return (matchzyTeam1.teamName, slot);
             }
-            else if (t2score > t1score)
+            if (slot == MatchLogic.Team2)
             {
                 matchzyTeam2.seriesScore++;
-                return matchzyTeam2.teamName;
+                return (matchzyTeam2.teamName, slot);
             }
-
-            // At this point the map is tied on score. Depending on the configured
-            // overtime behavior we either:
-            // - Treat this as a true draw (legacy behavior), or
-            // - Apply a performance-based tiebreaker to pick a winner.
-            //
-            // Current rule:
-            // - If the external config has explicitly disabled overtime and set
-            //   overtimeSegments = 0, we resolve ties by comparing aggregate team
-            //   performance instead of reporting a draw.
-            // - If overtime is enabled and overtimeSegments > 0, we also resolve
-            //   any final tie via the same performance-based tiebreaker. This lets
-            //   tournament flows express "no draws after OT" semantics while we
-            //   still rely on CS2 to run the OT rounds themselves.
-            bool overtimeDisabled =
-                !string.IsNullOrWhiteSpace(matchConfig.OvertimeMode) &&
-                matchConfig.OvertimeMode.Equals("disabled", StringComparison.OrdinalIgnoreCase);
-
-            int? overtimeSegments = matchConfig.OvertimeSegments;
-
-            // Interpret a missing overtimeSegments value as 0 when overtime is
-            // explicitly disabled. This makes `"overtimeMode": "disabled"` alone
-            // mean "no OT, no draws" without requiring the platform to always send
-            // an explicit `overtimeSegments: 0`.
-            bool disableOtNoDraw = overtimeDisabled && (!overtimeSegments.HasValue || overtimeSegments.Value == 0);
-
-            // When overtime is enabled and overtimeSegments > 0, we treat any final
-            // tie as "no draws after OT" and resolve it via the performance-based
-            // tiebreak.
-            bool enabledWithCap = !overtimeDisabled && overtimeSegments.HasValue && overtimeSegments.Value > 0;
-
-            bool performanceTiebreakRequested = disableOtNoDraw || enabledWithCap;
-
-            if (performanceTiebreakRequested)
-            {
-                string? tiebreakWinner = GetPerformanceTiebreakWinner();
-                if (!string.IsNullOrEmpty(tiebreakWinner))
-                {
-                    if (tiebreakWinner == matchzyTeam1.teamName)
-                    {
-                        matchzyTeam1.seriesScore++;
-                    }
-                    else if (tiebreakWinner == matchzyTeam2.teamName)
-                    {
-                        matchzyTeam2.seriesScore++;
-                    }
-
-                    Log($"[Tiebreak] Map ended tied on score (team1={t1score}, team2={t2score}). " +
-                        $"Overtime disabled with overtimeSegments=0, selecting '{tiebreakWinner}' as winner based on performance metrics.");
-
-                    return tiebreakWinner;
-                }
-
-                Log($"[Tiebreak] Map ended tied on score and performance metrics were also tied; " +
-                    $"falling back to a recorded draw.");
-            }
-
-            return "Draw";
+            return ("Draw", MatchLogic.NoTeam);
         }
 
         /// <summary>
-        /// Computes a performance-based tiebreak winner using per-player stats for
-        /// the current map. Currently this aggregates total Damage dealt by each
-        /// team (as reported by ActionTrackingServices) and picks the team with the
-        /// higher total. If both teams have identical Damage, this returns null and
-        /// the caller should treat the result as a true draw.
+        /// Aggregates the per-team tiebreak criteria (damage, kills, headshot kills,
+        /// utility damage) from the current map's player stats. On failure returns
+        /// zeroed totals, so the caller falls through to the deterministic coin flip
+        /// rather than recording a draw.
         /// </summary>
-        /// <returns>The winning team name, or null if still tied.</returns>
-        private string? GetPerformanceTiebreakWinner()
+        private (MatchLogic.TiebreakTotals team1, MatchLogic.TiebreakTotals team2) GetTiebreakTotals()
         {
+            int d1 = 0, k1 = 0, h1 = 0, u1 = 0;
+            int d2 = 0, k2 = 0, h2 = 0, u2 = 0;
             try
             {
                 (Dictionary<ulong, Dictionary<string, object>> playerStatsDictionary, _, _) = GetPlayerStatsDict();
 
-                int team1DamageTotal = 0;
-                int team2DamageTotal = 0;
+                static int Stat(Dictionary<string, object> stats, string key) =>
+                    stats.TryGetValue(key, out var value) && int.TryParse(value?.ToString(), out int parsed) ? parsed : 0;
 
-                foreach (var kvp in playerStatsDictionary)
+                foreach (var stats in playerStatsDictionary.Values)
                 {
-                    var stats = kvp.Value;
-
-                    if (!stats.TryGetValue("TeamName", out var teamNameObj) ||
-                        !stats.TryGetValue("Damage", out var damageObj))
-                    {
-                        continue;
-                    }
-
-                    string teamName = teamNameObj.ToString() ?? string.Empty;
-                    if (!int.TryParse(damageObj.ToString(), out int damage))
-                    {
-                        continue;
-                    }
+                    if (!stats.TryGetValue("TeamName", out var teamNameObj)) continue;
+                    string teamName = teamNameObj?.ToString() ?? string.Empty;
 
                     if (teamName == matchzyTeam1.teamName)
                     {
-                        team1DamageTotal += damage;
+                        d1 += Stat(stats, "Damage"); k1 += Stat(stats, "Kills");
+                        h1 += Stat(stats, "HeadShotKills"); u1 += Stat(stats, "UtilityDamage");
                     }
                     else if (teamName == matchzyTeam2.teamName)
                     {
-                        team2DamageTotal += damage;
+                        d2 += Stat(stats, "Damage"); k2 += Stat(stats, "Kills");
+                        h2 += Stat(stats, "HeadShotKills"); u2 += Stat(stats, "UtilityDamage");
                     }
                 }
-
-                Log($"[Tiebreak] Aggregate damage totals - {matchzyTeam1.teamName}: {team1DamageTotal}, {matchzyTeam2.teamName}: {team2DamageTotal}");
-
-                if (team1DamageTotal > team2DamageTotal)
-                {
-                    return matchzyTeam1.teamName;
-                }
-
-                if (team2DamageTotal > team1DamageTotal)
-                {
-                    return matchzyTeam2.teamName;
-                }
-
-                // Perfect tie on damage as well – extremely unlikely, but in this case
-                // we deliberately do NOT pick an arbitrary winner.
-                return null;
             }
             catch (Exception ex)
             {
-                Log($"[Tiebreak FATAL] Failed to compute performance-based tiebreak winner: {ex.Message}");
-                return null;
+                Log($"[Tiebreak FATAL] Failed to aggregate tiebreak stats: {ex.Message}");
             }
+
+            Log($"[Tiebreak] Aggregate totals (damage/kills/headshot_kills/utility_damage) - " +
+                $"{matchzyTeam1.teamName}: {d1}/{k1}/{h1}/{u1}, {matchzyTeam2.teamName}: {d2}/{k2}/{h2}/{u2}");
+            return (new MatchLogic.TiebreakTotals(d1, k1, h1, u1), new MatchLogic.TiebreakTotals(d2, k2, h2, u2));
         }
 
         private (int t1score, int t2score) GetTeamsScore()
@@ -2705,9 +2653,10 @@ namespace MatchZy
 
                     int currentMapNumber = matchConfig.CurrentMapNumber;
                     long matchId = liveMatchId;
-                    int ctTeamNum = reverseTeamSides["CT"] == matchzyTeam1 ? 1 : 2;
-                    int tTeamNum = reverseTeamSides["TERRORIST"] == matchzyTeam1 ? 1 : 2;
-                    Winner winner = new(@event.Winner.ToString(), t1score > t2score ? "team1" : "team2");
+                    // The round winner is whichever team is on the winning side this round
+                    // (sides swap after this event is built), not whoever leads the map.
+                    string roundWinnerSlot = MatchLogic.SlotForTeamNum(@event.Winner, teamSides[matchzyTeam1]) ?? MatchLogic.NoTeam;
+                    Winner winner = new(@event.Winner.ToString(), roundWinnerSlot);
 
                     var roundEndEvent = new MatchZyRoundEndedEvent
                     {
@@ -2717,8 +2666,8 @@ namespace MatchZy
                         Reason = @event.Reason,
                         RoundTime = 0,
                         Winner = winner,
-                        StatsTeam1 = new MatchZyStatsTeam(matchzyTeam1.id, matchzyTeam1.teamName, 0, t1score, 0, 0, playerStatsListTeam1),
-                        StatsTeam2 = new MatchZyStatsTeam(matchzyTeam2.id, matchzyTeam2.teamName, 0, t2score, 0, 0, playerStatsListTeam2),
+                        StatsTeam1 = new MatchZyStatsTeam(matchzyTeam1.id, matchzyTeam1.teamName, matchzyTeam1.seriesScore, t1score, 0, 0, playerStatsListTeam1),
+                        StatsTeam2 = new MatchZyStatsTeam(matchzyTeam2.id, matchzyTeam2.teamName, matchzyTeam2.seriesScore, t2score, 0, 0, playerStatsListTeam2),
                     };
 
                     Task.Run(async () =>
@@ -3459,8 +3408,26 @@ namespace MatchZy
                 }
 
                 string renderedValue = IsSafeCVarValueUnquoted(trimmed) ? trimmed : QuoteAndEscape(trimmed);
-                Log($"[ExecuteChangedConvars] Execing: {key} {renderedValue}");
+                Log($"[ExecuteChangedConvars] Execing: {key} {(SecretRedactor.IsSecretKey(key) ? SecretRedactor.Hidden(trimmed) : renderedValue)}");
                 Server.ExecuteCommand($"{key} {renderedValue}");
+            }
+        }
+
+        private readonly MatchRestartDelayLogic matchRestartDelay = new();
+
+        /// <summary>
+        /// Puts mp_match_restart_delay back to the operator's value if HandleMatchEnd raised it
+        /// for GOTV. Safe to call repeatedly; a no-op when nothing was raised.
+        /// </summary>
+        private void RestoreMatchRestartDelay(string reason)
+        {
+            var cvar = ConVar.Find("mp_match_restart_delay");
+            if (cvar == null) return;
+            int current = cvar.GetPrimitiveValue<int>();
+            if (matchRestartDelay.Restore(current) is int original)
+            {
+                Log($"[RestoreMatchRestartDelay] Restoring mp_match_restart_delay from {current} to {original} ({reason}).");
+                cvar.SetValue(original);
             }
         }
 
@@ -3469,7 +3436,7 @@ namespace MatchZy
             foreach (string key in matchConfig.OriginalCvars.Keys)
             {
                 string value = matchConfig.OriginalCvars[key];
-                Log($"[ResetChangedConvars] Execing: {key} \"{value}\"");
+                Log($"[ResetChangedConvars] Execing: {key} \"{SecretRedactor.FormatValue(key, value)}\"");
                 Server.ExecuteCommand($"{key} {value}");
             }
         }
@@ -3718,6 +3685,122 @@ namespace MatchZy
             return regex.Replace(input, "");
         }
 
+        /// <summary>The game process's argv, read once in Load (see ServerIdentity.ReadProcessCommandLine).</summary>
+        private string[]? processCommandLineArgs;
+
+        /// <summary>True once the server has activated (first OnMapStart, or a hot reload).</summary>
+        private bool serverActivated;
+
+        /// <summary>
+        /// True when Load could not identify this server from its start arguments, so loading
+        /// persistent config waits for the first OnMapStart (config.cfg and hostport are applied by then).
+        /// </summary>
+        private bool persistentConfigLoadPending;
+
+        private string? lastLoggedConfigScope;
+
+        /// <summary>
+        /// Resolves the identity that scopes this server's rows in the MatchZy database.
+        ///
+        /// Invoked lazily by Database on the first config read or write, and again on later
+        /// accesses only while the result is provisional (see ScopeResolution.IsFinal). It cannot
+        /// come from the database, because it decides which rows the database hands back.
+        /// </summary>
+        private ScopeResolution ResolveServerConfigScope()
+        {
+            string? convarScope = null;
+            try
+            {
+                convarScope = configScopeOverride?.Value;
+            }
+            catch { /* the convar is optional */ }
+
+            string? convarBindIp = null;
+            try
+            {
+                convarBindIp = ConVar.Find("ip")?.StringValue;
+            }
+            catch { /* the convar is optional */ }
+
+            // Before activation hostport still holds the engine default (27015) on every server,
+            // so it is only read once the server has activated.
+            int? hostport = null;
+            if (serverActivated)
+            {
+                try
+                {
+                    var hostPortConVar = ConVar.Find("hostport");
+                    if (hostPortConVar != null)
+                    {
+                        try
+                        {
+                            hostport = hostPortConVar.GetPrimitiveValue<int>();
+                        }
+                        catch
+                        {
+                            if (int.TryParse(hostPortConVar.StringValue, out int parsed)) hostport = parsed;
+                        }
+                    }
+                }
+                catch { /* the convar is optional */ }
+            }
+
+            string? machineName = null;
+            try
+            {
+                machineName = Environment.MachineName;
+            }
+            catch { /* falls back to ServerIdentity.UnknownHost */ }
+
+            string? installPath = null;
+            try
+            {
+                installPath = Server.GameDirectory;
+            }
+            catch { /* try the process path below */ }
+            if (string.IsNullOrWhiteSpace(installPath))
+            {
+                try
+                {
+                    installPath = Environment.ProcessPath;
+                }
+                catch { /* falls back to the process id */ }
+            }
+
+            ScopeResolution resolution = ServerIdentity.Resolve(new ScopeInputs
+            {
+                CommandLineArgs = processCommandLineArgs,
+                ConvarScope = convarScope,
+                ConvarBindIp = convarBindIp,
+                HostportConvar = hostport,
+                ServerActivated = serverActivated,
+                MachineName = machineName,
+                InstallPath = installPath,
+                ProcessId = Environment.ProcessId,
+            });
+
+            if (resolution.Scope != lastLoggedConfigScope)
+            {
+                lastLoggedConfigScope = resolution.Scope;
+                string provisional = resolution.IsFinal ? "" : "; provisional until the server activates";
+                Log($"[ConfigScope] Using scope '{resolution.Scope}' ({resolution.Description}{provisional})");
+
+                if (resolution.IsFallback && resolution.IsFinal)
+                {
+                    string warning =
+                        $"[ConfigScope] WARNING: could not identify this server for its persistent config. " +
+                        $"Neither +matchzy_config_scope nor a game port was found (install path: '{installPath ?? "unknown"}'). " +
+                        $"Add '+matchzy_config_scope <name>' to this server's start arguments so its config survives restarts and moves.";
+                    Log(warning);
+                    Console.ForegroundColor = ConsoleColor.Red;
+                    Console.WriteLine(warning);
+                    Console.ResetColor();
+                }
+            }
+
+            return resolution;
+        }
+
         /// <summary>
         /// Loads persistent configuration from database.
         /// These values override config.cfg and survive server restarts.
@@ -3733,7 +3816,7 @@ namespace MatchZy
                 if (!string.IsNullOrEmpty(remoteLogUrl))
                 {
                     matchConfig.RemoteLogURL = remoteLogUrl;
-                    Log($"[LoadPersistentConfig] Loaded matchzy_remote_log_url: {remoteLogUrl}");
+                    Log($"[LoadPersistentConfig] Loaded matchzy_remote_log_url: {SecretRedactor.FormatValue("matchzy_remote_log_url", remoteLogUrl)}");
                 }
                 
                 // Load remote log header key
@@ -3749,7 +3832,7 @@ namespace MatchZy
                 if (!string.IsNullOrEmpty(remoteLogHeaderValue))
                 {
                     matchConfig.RemoteLogHeaderValue = remoteLogHeaderValue;
-                    Log($"[LoadPersistentConfig] Loaded matchzy_remote_log_header_value (hidden for security)");
+                    Log($"[LoadPersistentConfig] Loaded matchzy_remote_log_header_value {SecretRedactor.Hidden(remoteLogHeaderValue)}");
                 }
                 
                 // Load demo upload URL
@@ -3757,7 +3840,7 @@ namespace MatchZy
                 if (!string.IsNullOrEmpty(demoUploadUrl))
                 {
                     demoUploadURL = demoUploadUrl;
-                    Log($"[LoadPersistentConfig] Loaded matchzy_demo_upload_url: {demoUploadUrl}");
+                    Log($"[LoadPersistentConfig] Loaded matchzy_demo_upload_url: {SecretRedactor.FormatValue("matchzy_demo_upload_url", demoUploadUrl)}");
                 }
                 
                 // Load chat prefix
@@ -3789,14 +3872,14 @@ namespace MatchZy
                 if (!string.IsNullOrEmpty(bootstrapUrl))
                 {
                     this.bootstrapUrl = bootstrapUrl;
-                    Log($"[LoadPersistentConfig] Loaded matchzy_bootstrap_url: {bootstrapUrl}");
+                    Log($"[LoadPersistentConfig] Loaded matchzy_bootstrap_url: {SecretRedactor.FormatValue("matchzy_bootstrap_url", bootstrapUrl)}");
                 }
 
                 var bootstrapToken = database.LoadConfigValue("matchzy_bootstrap_token");
                 if (!string.IsNullOrEmpty(bootstrapToken))
                 {
                     this.bootstrapToken = bootstrapToken;
-                    Log($"[LoadPersistentConfig] Loaded matchzy_bootstrap_token (hidden for security)");
+                    Log($"[LoadPersistentConfig] Loaded matchzy_bootstrap_token {SecretRedactor.Hidden(bootstrapToken)}");
                 }
 
                 // Load MAT heartbeat integration settings
@@ -3804,21 +3887,21 @@ namespace MatchZy
                 if (!string.IsNullOrEmpty(heartbeatUrl))
                 {
                     this.heartbeatUrl = heartbeatUrl;
-                    Log($"[LoadPersistentConfig] Loaded matchzy_heartbeat_url: {heartbeatUrl}");
+                    Log($"[LoadPersistentConfig] Loaded matchzy_heartbeat_url: {SecretRedactor.FormatValue("matchzy_heartbeat_url", heartbeatUrl)}");
                 }
 
                 var matchToken = database.LoadConfigValue("matchzy_match_token");
                 if (!string.IsNullOrEmpty(matchToken))
                 {
                     this.matchToken = matchToken;
-                    Log($"[LoadPersistentConfig] Loaded matchzy_match_token (hidden for security)");
+                    Log($"[LoadPersistentConfig] Loaded matchzy_match_token {SecretRedactor.Hidden(matchToken)}");
                 }
 
                 var webhookUrl = database.LoadConfigValue("matchzy_webhook_url");
                 if (!string.IsNullOrEmpty(webhookUrl))
                 {
                     this.webhookUrl = webhookUrl;
-                    Log($"[LoadPersistentConfig] Loaded matchzy_webhook_url: {webhookUrl}");
+                    Log($"[LoadPersistentConfig] Loaded matchzy_webhook_url: {SecretRedactor.FormatValue("matchzy_webhook_url", webhookUrl)}");
                 }
 
                 // Load report endpoint if it was persisted by a controller
@@ -3826,7 +3909,7 @@ namespace MatchZy
                 if (!string.IsNullOrEmpty(reportEndpoint))
                 {
                     matchReportEndpoint.Value = reportEndpoint;
-                    Log($"[LoadPersistentConfig] Loaded matchzy_report_endpoint: {reportEndpoint}");
+                    Log($"[LoadPersistentConfig] Loaded matchzy_report_endpoint: {SecretRedactor.FormatValue("matchzy_report_endpoint", reportEndpoint)}");
                 }
 
                 // Load report token if it was persisted by a controller
@@ -3834,7 +3917,7 @@ namespace MatchZy
                 if (!string.IsNullOrEmpty(reportToken))
                 {
                     matchReportToken.Value = reportToken;
-                    Log("[LoadPersistentConfig] Loaded matchzy_report_token (hidden for security)");
+                    Log($"[LoadPersistentConfig] Loaded matchzy_report_token {SecretRedactor.Hidden(reportToken)}");
                 }
 
                 // Load optional MAT admin list integration settings
@@ -3842,7 +3925,7 @@ namespace MatchZy
                 if (!string.IsNullOrEmpty(adminsUrl))
                 {
                     matchzyAdminsUrl = adminsUrl.Trim();
-                    Log($"[LoadPersistentConfig] Loaded matchzy_admins_url: {matchzyAdminsUrl}");
+                    Log($"[LoadPersistentConfig] Loaded matchzy_admins_url: {SecretRedactor.FormatValue("matchzy_admins_url", matchzyAdminsUrl)}");
                 }
 
                 var adminsRefreshSecondsRaw = database.LoadConfigValue("matchzy_admins_refresh_seconds");
@@ -4238,7 +4321,7 @@ namespace MatchZy
                 if (!string.IsNullOrEmpty(headerKey) && !string.IsNullOrEmpty(headerValue))
                 {
                     httpClient.DefaultRequestHeaders.Add(headerKey, headerValue);
-                    Log($"[UploadFileAsync]   - Custom header: {headerKey} = [REDACTED]");
+                    Log($"[UploadFileAsync]   - Custom header: {SecretRedactor.FormatCustomHeader(headerKey, headerValue)}");
                 }
 
                 HttpResponseMessage? response = null;
@@ -4251,7 +4334,7 @@ namespace MatchZy
                 {
                     try
                     {
-                        Log($"[UploadFileAsync] Sending POST request to {fileUploadURL} (attempt {attempt}/{maxAttempts})...");
+                        Log($"[UploadFileAsync] Sending POST request to {SecretRedactor.RedactText(fileUploadURL)} (attempt {attempt}/{maxAttempts})...");
                         DateTime uploadStart = DateTime.Now;
                         response = await httpClient.PostAsync(fileUploadURL, content).ConfigureAwait(false);
                         uploadDuration = DateTime.Now - uploadStart;
@@ -4285,7 +4368,7 @@ namespace MatchZy
                     Log($"[UploadFileAsync] MatchId: {matchId}, MapNumber: {mapNumber}");
                     Log($"[UploadFileAsync] FileName: {fileName}");
                     Log($"[UploadFileAsync] FileSize: {fileSizeMB:F2} MB");
-                    Log($"[UploadFileAsync] Response: {responseBody}");
+                    Log($"[UploadFileAsync] Response: {SecretRedactor.RedactText(responseBody)}");
                     Log($"[UploadFileAsync] ===========================");
                     Log($"[DEMO_UPLOAD] SUCCESS matchId={matchId} map={mapNumber} sizeMB={fileSizeMB:F2} seconds={uploadDuration.TotalSeconds:F2} status={(int)response.StatusCode}");
 
@@ -4328,7 +4411,7 @@ namespace MatchZy
                     }
                     Log($"[UploadFileAsync] ===== Upload FAILED =====");
                     Log($"[UploadFileAsync] Status code: {response.StatusCode}");
-                    Log($"[UploadFileAsync] Response body: {responseBody}");
+                    Log($"[UploadFileAsync] Response body: {SecretRedactor.RedactText(responseBody)}");
                     Log($"[UploadFileAsync] MatchId: {matchId}, MapNumber: {mapNumber}");
                     Log($"[UploadFileAsync] FileName: {fileName}");
                     Log($"[UploadFileAsync] ===========================");

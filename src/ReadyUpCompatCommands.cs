@@ -104,7 +104,7 @@ namespace MatchZy
             Server.ExecuteCommand("matchzy_remote_log_header_key \"X-MatchZy-Token\"");
             Server.ExecuteCommand($"matchzy_remote_log_header_value \"{matchToken}\"");
 
-            // Configure bootstrap token (used by TryBootstrapFetch()).
+            // Configure bootstrap token (a change schedules a debounced bootstrap fetch).
             Server.ExecuteCommand($"matchzy_bootstrap_token \"{matchToken}\"");
 
             // Configure match report token used by /api/events/report auth.
@@ -196,18 +196,10 @@ namespace MatchZy
             if (isMatchSetup)
             {
                 string currentStatus = tournamentStatus.Value ?? string.Empty;
-                if (string.Equals(currentStatus, "postgame", StringComparison.OrdinalIgnoreCase))
+                if (CanQueueMatchLoad(currentStatus))
                 {
-                    queuedMatchUrl = url;
-                    queuedMatchHeaderName = "Authorization";
-                    queuedMatchHeaderValue = string.IsNullOrWhiteSpace(matchToken) ? "" : $"Bearer {matchToken}";
-                    isMatchQueued = true;
-
-                    // Surface state to allocator/UI.
-                    UpdateTournamentStatus("queued");
-                    tournamentNextMatch.Value = DeriveIdentifierFromUrlOrPath(url) ?? url;
-
-                    Log($"[matchzy match load] Current match {liveMatchId} is postgame. Queued next match from URL: {url}");
+                    string authHeaderValue = string.IsNullOrWhiteSpace(matchToken) ? "" : $"Bearer {matchToken}";
+                    QueueMatchLoad(null, "matchzy match load", url, authHeaderValue == "" ? "" : "Authorization", authHeaderValue);
                 }
                 else
                 {
@@ -218,7 +210,7 @@ namespace MatchZy
 
             if (!IsValidUrl(url))
             {
-                Log($"[matchzy match load] Invalid URL: {url}");
+                Log($"[matchzy match load] Invalid URL: {SecretRedactor.RedactText(url)}");
                 UpdateTournamentStatus("error");
                 return;
             }
@@ -226,7 +218,7 @@ namespace MatchZy
             string token = string.IsNullOrWhiteSpace(matchToken) ? "" : matchToken.Trim();
             string authHeader = string.IsNullOrWhiteSpace(token) ? "" : $"Bearer {token}";
 
-            Log($"[matchzy match load] Fetching match config from {url} (auth={(string.IsNullOrWhiteSpace(authHeader) ? "none" : "bearer")})");
+            Log($"[matchzy match load] Fetching match config from {SecretRedactor.RedactText(url)} (auth={(string.IsNullOrWhiteSpace(authHeader) ? "none" : "bearer")})");
 
             Task.Run(async () =>
             {
@@ -243,7 +235,7 @@ namespace MatchZy
 
                     if (!response.IsSuccessStatusCode)
                     {
-                        Log($"[matchzy match load] HTTP fetch failed ({(int)response.StatusCode}): {jsonData}");
+                        Log($"[matchzy match load] HTTP fetch failed ({(int)response.StatusCode}): {SecretRedactor.RedactText(jsonData)}");
                         Server.NextFrame(() =>
                         {
                             UpdateTournamentStatus("error");

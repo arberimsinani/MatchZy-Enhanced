@@ -1,6 +1,7 @@
 using System;
 using System.IO;
 using System.Data;
+using System.Data.Common;
 using System.Text.Json;
 using System.Globalization;
 using System.Linq;
@@ -29,7 +30,15 @@ namespace MatchZy
 
     public class Database
     {
-        private IDbConnection connection = null!; // Initialized in ConnectDatabase()
+        // Connection string for the configured backend; set in ConnectDatabase().
+        //
+        // Every operation opens its own connection (pooled by both MySqlConnector and
+        // Microsoft.Data.Sqlite) and disposes it when done. A single shared connection
+        // used to be reused from the game thread, Task.Run continuations and the event
+        // retry timer at the same time, which MySqlConnector rejects with
+        // "Can't replace active reader" / "This MySqlConnection is already in use",
+        // after which every later query on that connection failed too.
+        private string connectionString = "";
 
         DatabaseConfig? config;
         public DatabaseType databaseType { get; set; }
@@ -38,40 +47,119 @@ namespace MatchZy
         public bool LastHealthOk { get; private set; } = true;
         public string? LastHealthError { get; private set; } = null;
 
+        /// <summary>
+        /// Supplies this server's identity for scoping rows in the shared database. Invoked lazily
+        /// on the first config read or write, not when it is assigned.
+        /// </summary>
+        public Func<ScopeResolution>? ScopeProvider { get; set; }
+
+        private string? resolvedScope;
+
+        /// <summary>
+        /// This server's scope. A final resolution is cached for the life of the process, so the
+        /// scope never changes once it is known. A provisional one (no explicit scope and no port
+        /// on the command line, before the server has activated) is used but not cached, so the
+        /// hostport convar can still take over after OnMapStart instead of freezing a fallback.
+        ///
+        /// With no provider at all (outside the game server) this is the legacy scope, matching
+        /// the pre-scoping plugin. A provider error never degrades to the legacy scope, because
+        /// that row is shared by every server on the database.
+        /// </summary>
+        public string ServerScope
+        {
+            get
+            {
+                if (resolvedScope != null) return resolvedScope;
+
+                if (ScopeProvider == null)
+                {
+                    resolvedScope = ServerIdentity.LegacyScope;
+                    return resolvedScope;
+                }
+
+                try
+                {
+                    ScopeResolution resolution = ScopeProvider.Invoke();
+                    if (resolution.IsFinal) resolvedScope = resolution.Scope;
+                    return resolution.Scope;
+                }
+                catch (Exception ex)
+                {
+                    Log($"[ServerScope] Error resolving server scope: {ex.Message}");
+                    return ServerIdentity.Sanitize($"{Environment.MachineName}:pid-{Environment.ProcessId}");
+                }
+            }
+        }
+
+        private bool IsSqlite => databaseType != DatabaseType.MySQL;
+
+        private DbConnection CreateConnection() => IsSqlite
+            ? new SqliteConnection(connectionString)
+            : new MySqlConnection(connectionString);
+
+        private IDbConnection OpenConnection()
+        {
+            DbConnection connection = CreateConnection();
+            try
+            {
+                connection.Open();
+                return connection;
+            }
+            catch
+            {
+                connection.Dispose();
+                throw;
+            }
+        }
+
+        private async Task<DbConnection> OpenConnectionAsync()
+        {
+            DbConnection connection = CreateConnection();
+            try
+            {
+                await connection.OpenAsync();
+                return connection;
+            }
+            catch
+            {
+                await connection.DisposeAsync();
+                throw;
+            }
+        }
+
         public void InitializeDatabase(string directory)
         {
             ConnectDatabase(directory);
             try
             {
-                connection.Open();
-                string dbType = (connection is SqliteConnection) ? "SQLite" : "MySQL";
+                using IDbConnection connection = OpenConnection();
+                string dbType = IsSqlite ? "SQLite" : "MySQL";
                 Log($"[InitializeDatabase] {dbType} Database connection successful");
 
                 // Create the `matchzy_stats_matches`, `matchzy_stats_players` and `matchzy_stats_maps` tables if they doesn't exist
-                if (connection is SqliteConnection) {
-                    CreateRequiredTablesSQLite();
+                if (IsSqlite) {
+                    CreateRequiredTablesSQLite(connection);
                 } else {
-                    CreateRequiredTablesSQL();
+                    CreateRequiredTablesSQL(connection);
                 }
 
                 Log("[InitializeDatabase] Table matchzy_stats_matches created (or already exists)");
                 Log("[InitializeDatabase] Table matchzy_stats_players created (or already exists)");
                 Log("[InitializeDatabase] Table matchzy_stats_maps created (or already exists)");
                 
-                // Create server config table for persistent configuration
-                if (connection is SqliteConnection) {
-                    CreateServerConfigTableSQLite();
-                } else {
-                    CreateServerConfigTableSQL();
-                }
+                // Create (or migrate) the server config table for persistent configuration.
+                // Both tables below hold per-server state and are scoped by server identity so
+                // several servers can share one database; see PersistentConfigStore.
+                PersistentConfigStore.EnsureConfigSchema(connection, IsSqlite, Log);
                 Log("[InitializeDatabase] Table matchzy_server_config created (or already exists)");
-                
+
                 // Create event queue table for reliable event delivery
-                if (connection is SqliteConnection) {
-                    CreateEventQueueTableSQLite();
+                if (IsSqlite) {
+                    CreateEventQueueTableSQLite(connection);
                 } else {
-                    CreateEventQueueTableSQL();
+                    CreateEventQueueTableSQL(connection);
                 }
+                PersistentConfigStore.EnsureEventQueueSchema(connection, IsSqlite, Log);
                 Log("[InitializeDatabase] Table matchzy_event_queue created (or already exists)");
             }
             catch (Exception ex)
@@ -98,13 +186,10 @@ namespace MatchZy
         /// </summary>
         public (bool ok, string dbType, string? error) CheckHealth()
         {
-            string dbType = (connection is SqliteConnection) ? "sqlite" : "mysql";
+            string dbType = IsSqlite ? "sqlite" : "mysql";
             try
             {
-                if (connection.State == ConnectionState.Closed)
-                {
-                    connection.Open();
-                }
+                using IDbConnection connection = OpenConnection();
 
                 // Use a trivial query that should work on both SQLite and MySQL.
                 connection.ExecuteScalar<int>("SELECT 1");
@@ -119,20 +204,6 @@ namespace MatchZy
                 LastHealthError = ex.Message;
                 return (false, dbType, ex.Message);
             }
-            finally
-            {
-                try
-                {
-                    if (connection != null && connection.State == ConnectionState.Open)
-                    {
-                        connection.Close();
-                    }
-                }
-                catch
-                {
-                    // ignore
-                }
-            }
         }
 
         public void ConnectDatabase(string directory)
@@ -144,7 +215,7 @@ namespace MatchZy
                 if (databaseType == DatabaseType.SQLite)
                 {
                     string dbPath = Path.Join(directory, "matchzy.db");
-                    connection = new SqliteConnection($"Data Source={dbPath}");
+                    connectionString = $"Data Source={dbPath}";
                     Log($"[ConnectDatabase] Using SQLite database: {dbPath}");
                 }
                 else if (config != null && databaseType == DatabaseType.MySQL)
@@ -152,8 +223,7 @@ namespace MatchZy
                     // Build connection string with timeout settings
                     // ConnectionTimeout: Time to wait for initial connection (default 15s, we'll use 10s)
                     // DefaultCommandTimeout: Time to wait for commands to execute (default 30s, we'll use 15s)
-                    string connectionString = $"Server={config.MySqlHost};Port={config.MySqlPort};Database={config.MySqlDatabase};User Id={config.MySqlUsername};Password={config.MySqlPassword};Connection Timeout=10;Default Command Timeout=15;";
-                    connection = new MySqlConnection(connectionString);
+                    connectionString = $"Server={config.MySqlHost};Port={config.MySqlPort};Database={config.MySqlDatabase};User Id={config.MySqlUsername};Password={config.MySqlPassword};Connection Timeout=10;Default Command Timeout=15;";
                     
                     // Log connection details (mask password for security)
                     string maskedPassword = string.IsNullOrEmpty(config.MySqlPassword) ? "(empty)" : "***";
@@ -162,7 +232,7 @@ namespace MatchZy
                 else
                 {
                     Log($"[ConnectDatabase] Invalid database specified, using SQLite.");
-                    connection = new SqliteConnection($"Data Source={Path.Join(directory, "matchzy.db")}");
+                    connectionString = $"Data Source={Path.Join(directory, "matchzy.db")}";
                     databaseType = DatabaseType.SQLite;
                 }
             } 
@@ -178,7 +248,7 @@ namespace MatchZy
 
         }
 
-        public void CreateRequiredTablesSQLite()
+        private static void CreateRequiredTablesSQLite(IDbConnection connection)
         {
             connection.Execute($@"
             CREATE TABLE IF NOT EXISTS matchzy_stats_matches (
@@ -252,7 +322,7 @@ namespace MatchZy
                 )");
         }
 
-        public void CreateRequiredTablesSQL()
+        private static void CreateRequiredTablesSQL(IDbConnection connection)
         {
             connection.Execute($@"
                 CREATE TABLE IF NOT EXISTS matchzy_stats_matches (
@@ -327,27 +397,7 @@ namespace MatchZy
             )");
         }
 
-        public void CreateServerConfigTableSQLite()
-        {
-            connection.Execute(@"
-                CREATE TABLE IF NOT EXISTS matchzy_server_config (
-                    config_key TEXT PRIMARY KEY,
-                    config_value TEXT NOT NULL,
-                    updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
-                )");
-        }
-
-        public void CreateServerConfigTableSQL()
-        {
-            connection.Execute(@"
-                CREATE TABLE IF NOT EXISTS matchzy_server_config (
-                    config_key VARCHAR(255) PRIMARY KEY,
-                    config_value TEXT NOT NULL,
-                    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
-                )");
-        }
-
-        public void CreateEventQueueTableSQLite()
+        private static void CreateEventQueueTableSQLite(IDbConnection connection)
         {
             connection.Execute(@"
                 CREATE TABLE IF NOT EXISTS matchzy_event_queue (
@@ -361,7 +411,8 @@ namespace MatchZy
                     last_retry DATETIME,
                     next_retry DATETIME,
                     status TEXT DEFAULT 'pending',
-                    error_message TEXT
+                    error_message TEXT,
+                    server_scope TEXT NOT NULL DEFAULT ''
                 )");
             
             // Create index for efficient querying of pending events
@@ -370,7 +421,7 @@ namespace MatchZy
                 ON matchzy_event_queue(status, next_retry)");
         }
 
-        public void CreateEventQueueTableSQL()
+        private static void CreateEventQueueTableSQL(IDbConnection connection)
         {
             connection.Execute(@"
                 CREATE TABLE IF NOT EXISTS matchzy_event_queue (
@@ -385,44 +436,29 @@ namespace MatchZy
                     next_retry TIMESTAMP NULL,
                     status VARCHAR(20) DEFAULT 'pending',
                     error_message TEXT,
-                    INDEX idx_status_retry (status, next_retry)
+                    server_scope VARCHAR(190) NOT NULL DEFAULT '',
+                    INDEX idx_status_retry (status, next_retry),
+                    INDEX idx_event_queue_scope_status (server_scope, status, next_retry)
                 )");
         }
 
         /// <summary>
-        /// Loads a configuration value from the database
+        /// Loads a configuration value from the database.
+        /// Prefers this server's scoped row and falls back to the legacy (pre-scoping) row, so a
+        /// single-server install keeps reading the values it already had.
         /// </summary>
         public string? LoadConfigValue(string key)
         {
             try
             {
-                if (connection.State == ConnectionState.Closed)
-                {
-                    connection.Open();
-                }
-                var result = connection.QueryFirstOrDefault<string>(
-                    "SELECT config_value FROM matchzy_server_config WHERE config_key = @Key",
-                    new { Key = key }
-                );
-                if (connection.State == ConnectionState.Open)
-                {
-                    connection.Close();
-                }
+                using IDbConnection connection = OpenConnection();
+                var result = PersistentConfigStore.LoadConfigValue(connection, key, ServerScope);
                 return result;
             }
             catch (Exception ex)
             {
                 Log($"[LoadConfigValue] Error loading config key '{key}': {ex.Message}");
                 LogConnectionDetails("LoadConfigValue");
-                // Ensure connection is closed on error
-                try
-                {
-                    if (connection != null && connection.State == ConnectionState.Open)
-                    {
-                        connection.Close();
-                    }
-                }
-                catch { }
                 return null;
             }
         }
@@ -434,54 +470,28 @@ namespace MatchZy
         {
             try
             {
-                if (connection.State == ConnectionState.Closed)
-                {
-                    connection.Open();
-                }
+                using IDbConnection connection = OpenConnection();
                 
                 // Calculate next retry time using exponential backoff (start with 30 seconds)
-                string nextRetryExpression = (connection is SqliteConnection) 
+                string nextRetryExpression = IsSqlite 
                     ? "datetime('now', '+30 seconds')" 
                     : "DATE_ADD(NOW(), INTERVAL 30 SECOND)";
                 
-                if (connection is SqliteConnection)
-                {
-                    connection.Execute($@"
-                        INSERT INTO matchzy_event_queue 
-                        (event_type, event_data, match_id, map_number, error_message, next_retry) 
-                        VALUES (@EventType, @EventData, @MatchId, @MapNumber, @ErrorMessage, {nextRetryExpression})",
-                        new { EventType = eventType, EventData = eventData, MatchId = matchId, MapNumber = mapNumber, ErrorMessage = errorMessage }
-                    );
-                }
-                else
-                {
-                    connection.Execute($@"
-                        INSERT INTO matchzy_event_queue 
-                        (event_type, event_data, match_id, map_number, error_message, next_retry) 
-                        VALUES (@EventType, @EventData, @MatchId, @MapNumber, @ErrorMessage, {nextRetryExpression})",
-                        new { EventType = eventType, EventData = eventData, MatchId = matchId, MapNumber = mapNumber, ErrorMessage = errorMessage }
-                    );
-                }
-                
-                if (connection.State == ConnectionState.Open)
-                {
-                    connection.Close();
-                }
+                // Stamped with this server's scope so a shared database does not let one server
+                // retry another server's events against the wrong remote log URL and headers.
+                connection.Execute($@"
+                    INSERT INTO matchzy_event_queue
+                    (event_type, event_data, match_id, map_number, error_message, next_retry, server_scope)
+                    VALUES (@EventType, @EventData, @MatchId, @MapNumber, @ErrorMessage, {nextRetryExpression}, @Scope)",
+                    new { EventType = eventType, EventData = eventData, MatchId = matchId, MapNumber = mapNumber, ErrorMessage = errorMessage, Scope = ServerScope }
+                );
+
                 Log($"[QueueEvent] Queued {eventType} event for matchId={matchId} (will retry in 30s)");
             }
             catch (Exception ex)
             {
                 Log($"[QueueEvent] Error queueing event: {ex.Message}");
                 LogConnectionDetails("QueueEvent");
-                // Ensure connection is closed on error
-                try
-                {
-                    if (connection != null && connection.State == ConnectionState.Open)
-                    {
-                        connection.Close();
-                    }
-                }
-                catch { }
             }
         }
 
@@ -492,42 +502,27 @@ namespace MatchZy
         {
             try
             {
-                if (connection.State == ConnectionState.Closed)
-                {
-                    connection.Open();
-                }
+                using IDbConnection connection = OpenConnection();
                 
-                string nowExpression = (connection is SqliteConnection) ? "datetime('now')" : "NOW()";
+                string nowExpression = IsSqlite ? "datetime('now')" : "NOW()";
                 
                 var events = connection.Query<QueuedEvent>($@"
                     SELECT id, event_type, event_data, match_id, map_number, retry_count
                     FROM matchzy_event_queue
-                    WHERE status = 'pending' 
+                    WHERE status = 'pending'
+                    AND {PersistentConfigStore.PendingEventsScopeClause}
                     AND (next_retry IS NULL OR next_retry <= {nowExpression})
                     AND retry_count < 20
                     ORDER BY created_at ASC
                     LIMIT {limit}
-                ").ToList();
+                ", new { Scope = ServerScope, LegacyScope = ServerIdentity.LegacyScope }).ToList();
                 
-                if (connection.State == ConnectionState.Open)
-                {
-                    connection.Close();
-                }
                 return events;
             }
             catch (Exception ex)
             {
                 Log($"[GetPendingEvents] Error: {ex.Message}");
                 LogConnectionDetails("GetPendingEvents");
-                // Ensure connection is closed on error
-                try
-                {
-                    if (connection != null && connection.State == ConnectionState.Open)
-                    {
-                        connection.Close();
-                    }
-                }
-                catch { }
                 return new List<QueuedEvent>();
             }
         }
@@ -539,35 +534,19 @@ namespace MatchZy
         {
             try
             {
-                if (connection.State == ConnectionState.Closed)
-                {
-                    connection.Open();
-                }
+                using IDbConnection connection = OpenConnection();
                 connection.Execute(@"
                     UPDATE matchzy_event_queue 
                     SET status = 'sent' 
                     WHERE id = @Id",
                     new { Id = eventId }
                 );
-                if (connection.State == ConnectionState.Open)
-                {
-                    connection.Close();
-                }
                 Log($"[MarkEventSent] Event {eventId} marked as sent successfully.");
             }
             catch (Exception ex)
             {
                 Log($"[MarkEventSent] Error: {ex.Message}");
                 LogConnectionDetails("MarkEventSent");
-                // Ensure connection is closed on error
-                try
-                {
-                    if (connection != null && connection.State == ConnectionState.Open)
-                    {
-                        connection.Close();
-                    }
-                }
-                catch { }
             }
         }
 
@@ -578,19 +557,16 @@ namespace MatchZy
         {
             try
             {
-                if (connection.State == ConnectionState.Closed)
-                {
-                    connection.Open();
-                }
+                using IDbConnection connection = OpenConnection();
                 
                 // Exponential backoff: 30s, 1m, 2m, 4m, 8m, 16m, 32m (capped at 32 minutes)
                 int delaySeconds = Math.Min(30 * (1 << retryCount), 1920);
                 
-                string nextRetryExpression = (connection is SqliteConnection)
+                string nextRetryExpression = IsSqlite
                     ? $"datetime('now', '+{delaySeconds} seconds')"
                     : $"DATE_ADD(NOW(), INTERVAL {delaySeconds} SECOND)";
                     
-                string lastRetryExpression = (connection is SqliteConnection)
+                string lastRetryExpression = IsSqlite
                     ? "datetime('now')"
                     : "NOW()";
                 
@@ -622,24 +598,11 @@ namespace MatchZy
                     Log($"[MarkEventRetry] Event {eventId} retry scheduled in {delaySeconds}s (attempt {retryCount + 1})");
                 }
                 
-                if (connection.State == ConnectionState.Open)
-                {
-                    connection.Close();
-                }
             }
             catch (Exception ex)
             {
                 Log($"[MarkEventRetry] Error: {ex.Message}");
                 LogConnectionDetails("MarkEventRetry");
-                // Ensure connection is closed on error
-                try
-                {
-                    if (connection != null && connection.State == ConnectionState.Open)
-                    {
-                        connection.Close();
-                    }
-                }
-                catch { }
             }
         }
 
@@ -650,25 +613,21 @@ namespace MatchZy
         {
             try
             {
-                if (connection.State == ConnectionState.Closed)
-                {
-                    connection.Open();
-                }
+                using IDbConnection connection = OpenConnection();
                 
-                string dateExpression = (connection is SqliteConnection)
+                string dateExpression = IsSqlite
                     ? "datetime('now', '-7 days')"
                     : "DATE_SUB(NOW(), INTERVAL 7 DAY)";
                 
+                // Deliberately unscoped: these events have already been delivered, so removing
+                // them is pure housekeeping. Keeping it global also stops a decommissioned
+                // server's rows accumulating forever in a shared database.
                 int deleted = connection.Execute($@"
-                    DELETE FROM matchzy_event_queue 
-                    WHERE status = 'sent' 
+                    DELETE FROM matchzy_event_queue
+                    WHERE status = 'sent'
                     AND created_at < {dateExpression}
                 ");
                 
-                if (connection.State == ConnectionState.Open)
-                {
-                    connection.Close();
-                }
                 
                 if (deleted > 0)
                 {
@@ -679,15 +638,6 @@ namespace MatchZy
             {
                 Log($"[CleanupOldEvents] Error: {ex.Message}");
                 LogConnectionDetails("CleanupOldEvents");
-                // Ensure connection is closed on error
-                try
-                {
-                    if (connection != null && connection.State == ConnectionState.Open)
-                    {
-                        connection.Close();
-                    }
-                }
-                catch { }
             }
         }
 
@@ -698,21 +648,18 @@ namespace MatchZy
         {
             try
             {
-                if (connection.State == ConnectionState.Closed)
-                {
-                    connection.Open();
-                }
+                using IDbConnection connection = OpenConnection();
                 
-                int deleted = connection.Execute(@"
-                    DELETE FROM matchzy_event_queue 
+                // Only this server's (and pre-scoping legacy) events. Clearing the queue happens
+                // when this server's remote log URL changes, which says nothing about the events
+                // another server on the same database still needs to send.
+                int deleted = connection.Execute($@"
+                    DELETE FROM matchzy_event_queue
                     WHERE status IN ('pending', 'failed')
-                ");
-                
-                if (connection.State == ConnectionState.Open)
-                {
-                    connection.Close();
-                }
-                
+                    AND {PersistentConfigStore.PendingEventsScopeClause}
+                ", new { Scope = ServerScope, LegacyScope = ServerIdentity.LegacyScope });
+
+
                 Log($"[ClearEventQueue] Cleared {deleted} pending/failed events from queue.");
                 return deleted;
             }
@@ -720,73 +667,29 @@ namespace MatchZy
             {
                 Log($"[ClearEventQueue] Error: {ex.Message}");
                 LogConnectionDetails("ClearEventQueue");
-                // Ensure connection is closed on error
-                try
-                {
-                    if (connection != null && connection.State == ConnectionState.Open)
-                    {
-                        connection.Close();
-                    }
-                }
-                catch { }
                 return 0;
             }
         }
 
         /// <summary>
-        /// Saves a configuration value to the database (insert or update)
+        /// Saves a configuration value to the database (insert or update).
+        /// Always writes this server's scoped row; the legacy row is never overwritten, so one
+        /// server writing can no longer change what another server loads.
         /// </summary>
         public void SaveConfigValue(string key, string value)
         {
             try
             {
-                if (connection.State == ConnectionState.Closed)
-                {
-                    connection.Open();
-                }
-                
-                if (connection is SqliteConnection)
-                {
-                    connection.Execute(@"
-                        INSERT INTO matchzy_server_config (config_key, config_value, updated_at) 
-                        VALUES (@Key, @Value, datetime('now'))
-                        ON CONFLICT(config_key) DO UPDATE SET 
-                            config_value = @Value,
-                            updated_at = datetime('now')",
-                        new { Key = key, Value = value }
-                    );
-                }
-                else
-                {
-                    connection.Execute(@"
-                        INSERT INTO matchzy_server_config (config_key, config_value) 
-                        VALUES (@Key, @Value)
-                        ON DUPLICATE KEY UPDATE 
-                            config_value = @Value,
-                            updated_at = CURRENT_TIMESTAMP",
-                        new { Key = key, Value = value }
-                    );
-                }
-                
-                if (connection.State == ConnectionState.Open)
-                {
-                    connection.Close();
-                }
-                Log($"[SaveConfigValue] Saved config: {key} = {value}");
+                using IDbConnection connection = OpenConnection();
+
+                PersistentConfigStore.SaveConfigValue(connection, IsSqlite, key, value, ServerScope);
+
+                Log($"[SaveConfigValue] Saved config for server '{ServerScope}': {key} = {SecretRedactor.FormatValue(key, value)}");
             }
             catch (Exception ex)
             {
                 Log($"[SaveConfigValue] Error saving config key '{key}': {ex.Message}");
                 LogConnectionDetails("SaveConfigValue");
-                // Ensure connection is closed on error
-                try
-                {
-                    if (connection != null && connection.State == ConnectionState.Open)
-                    {
-                        connection.Close();
-                    }
-                }
-                catch { }
             }
         }
 
@@ -797,10 +700,7 @@ namespace MatchZy
         {
             try
             {
-                if (connection.State == ConnectionState.Closed)
-                {
-                    connection.Open();
-                }
+                using IDbConnection connection = OpenConnection();
                 
                 // Get match info
                 var match = connection.QueryFirstOrDefault<dynamic>(@"
@@ -811,10 +711,6 @@ namespace MatchZy
                 
                 if (match == null)
                 {
-                    if (connection.State == ConnectionState.Open)
-                    {
-                        connection.Close();
-                    }
                     return null;
                 }
                 
@@ -834,10 +730,6 @@ namespace MatchZy
                     new { MatchId = matchId }
                 ).ToList();
                 
-                if (connection.State == ConnectionState.Open)
-                {
-                    connection.Close();
-                }
                 
                 // Build JSON structure
                 var result = new
@@ -853,15 +745,6 @@ namespace MatchZy
             {
                 Log($"[GetMatchStatsJson] Error: {ex.Message}");
                 LogConnectionDetails("GetMatchStatsJson");
-                // Ensure connection is closed on error
-                try
-                {
-                    if (connection != null && connection.State == ConnectionState.Open)
-                    {
-                        connection.Close();
-                    }
-                }
-                catch { }
                 return null;
             }
         }
@@ -870,8 +753,9 @@ namespace MatchZy
         {
             try
             {
+                using IDbConnection connection = OpenConnection();
                 string mapName = isMatchSetup ? matchConfig.Maplist[mapNumber] : Server.MapName;
-                string dateTimeExpression = (connection is SqliteConnection) ? "datetime('now')" : "NOW()";
+                string dateTimeExpression = IsSqlite ? "datetime('now')" : "NOW()";
 
                 if (mapNumber == 0) {
                     if (isMatchSetup && liveMatchId != -1) {
@@ -897,11 +781,11 @@ namespace MatchZy
 
                 // Retrieve the last inserted match_id
                 long matchId = -1;
-                if (connection is SqliteConnection)
+                if (IsSqlite)
                 {
                     matchId = connection.ExecuteScalar<long>("SELECT last_insert_rowid()");
                 }
-                else if (connection is MySqlConnection)
+                else
                 {
                     matchId = connection.ExecuteScalar<long>("SELECT LAST_INSERT_ID()");
                 }
@@ -924,6 +808,7 @@ namespace MatchZy
         public void UpdateTeamData(int matchId, string team1name, string team2name) {
             try
             {
+                using IDbConnection connection = OpenConnection();
                 connection.Execute(@"
                     UPDATE matchzy_stats_matches
                     SET team1_name = @team1name, team2_name = @team2name
@@ -942,7 +827,8 @@ namespace MatchZy
         {
             try
             {
-                string dateTimeExpression = (connection is SqliteConnection) ? "datetime('now')" : "NOW()";
+                await using DbConnection connection = await OpenConnectionAsync();
+                string dateTimeExpression = IsSqlite ? "datetime('now')" : "NOW()";
 
                 string sqlQuery = $@"
                     UPDATE matchzy_stats_maps
@@ -970,7 +856,8 @@ namespace MatchZy
         {
             try
             {
-                string dateTimeExpression = (connection is SqliteConnection) ? "datetime('now')" : "NOW()";
+                await using DbConnection connection = await OpenConnectionAsync();
+                string dateTimeExpression = IsSqlite ? "datetime('now')" : "NOW()";
 
                 string sqlQuery = $@"
                     UPDATE matchzy_stats_matches
@@ -991,6 +878,7 @@ namespace MatchZy
         {
             try
             {
+                await using DbConnection connection = await OpenConnectionAsync();
                 string sqlQuery = $@"
                     UPDATE matchzy_stats_maps
                     SET team1_score = @t1score, team2_score = @t2score
@@ -1008,6 +896,7 @@ namespace MatchZy
         {
             try
             {
+                await using DbConnection connection = await OpenConnectionAsync();
                 foreach (ulong steamid64 in playerStatsDictionary.Keys)
                 {
                     Log($"[UpdatePlayerStats] Going to update data for Match: {matchId}, MapNumber: {mapNumber}, Player: {steamid64}");
@@ -1046,7 +935,7 @@ namespace MatchZy
                         kill_reward = @kill_reward, live_time = @live_time, head_shot_kills = @head_shot_kills,
                         cash_earned = @cash_earned, enemies_flashed = @enemies_flashed";
 
-                    if (connection is SqliteConnection) {
+                    if (IsSqlite) {
                         sqlQuery = @"
                         INSERT OR REPLACE INTO matchzy_stats_players (
                             matchid, mapnumber, steamid64, team, name, kills, deaths, damage, assists,
@@ -1119,6 +1008,7 @@ namespace MatchZy
         public async Task WritePlayerStatsToCsv(string filePath, long matchId, int mapNumber)
         {
             try {
+                await using DbConnection connection = await OpenConnectionAsync();
                 string csvFilePath = $"{filePath}/match_data_map{mapNumber}_{matchId}.csv";
                 string? directoryPath = Path.GetDirectoryName(csvFilePath);
                 if (directoryPath != null)
@@ -1228,12 +1118,11 @@ namespace MatchZy
             if (config != null && databaseType == DatabaseType.MySQL)
             {
                 string maskedPassword = string.IsNullOrEmpty(config.MySqlPassword) ? "(empty)" : "***";
-                string connectionState = connection != null ? connection.State.ToString() : "null";
-                Log($"[{context}] Connection details - Host: {config.MySqlHost ?? "(null)"}, Port: {config.MySqlPort ?? 3306}, Database: {config.MySqlDatabase ?? "(null)"}, User: {config.MySqlUsername ?? "(null)"}, Password: {maskedPassword}, Connection State: {connectionState}");
+                Log($"[{context}] Connection details - Host: {config.MySqlHost ?? "(null)"}, Port: {config.MySqlPort ?? 3306}, Database: {config.MySqlDatabase ?? "(null)"}, User: {config.MySqlUsername ?? "(null)"}, Password: {maskedPassword}");
             }
-            else if (databaseType == DatabaseType.SQLite && connection != null)
+            else if (databaseType == DatabaseType.SQLite)
             {
-                Log($"[{context}] SQLite connection state: {connection.State}");
+                Log($"[{context}] SQLite connection string: {connectionString}");
             }
         }
 

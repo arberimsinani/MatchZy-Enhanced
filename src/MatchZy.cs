@@ -15,7 +15,7 @@ namespace MatchZy
 
         public override string ModuleName => "MatchZy";
 
-        public override string ModuleVersion => "1.4.25";
+        public override string ModuleVersion => "1.4.32";
 
         public override string ModuleAuthor => "sivert (https://github.com/sivert-io/)";
 
@@ -61,7 +61,6 @@ namespace MatchZy
         // Bootstrap init (one-shot configuration pull)
         private string bootstrapUrl = "";
         private string bootstrapToken = "";
-        private bool bootstrapFetchInProgress = false;
         private long lastBootstrapAttemptAt = 0;
 
         // MAT heartbeat integration (server -> allocator API)
@@ -165,10 +164,30 @@ namespace MatchZy
 
             // This sets default config ConVars
             Server.ExecuteCommand("execifexists MatchZy/config.cfg");
-            
-            // Load persistent configuration from database (overrides config.cfg if values exist)
-            LoadPersistentConfig();
-            
+
+            // Persistent config is scoped per server so several servers can share one database.
+            // The scope is resolved lazily on first use. Its start arguments are read from
+            // /proc/self/cmdline: Environment.GetCommandLineArgs() does not carry the game's argv
+            // when .NET is hosted inside cs2, which is why 1.4.26 resolved every server to <host>:27015.
+            var (commandLineArgs, commandLineSource) = ServerIdentity.ReadProcessCommandLine();
+            processCommandLineArgs = commandLineArgs;
+            serverActivated = hotReload;
+            database.ScopeProvider = ResolveServerConfigScope;
+
+            // Load persistent configuration from database (overrides config.cfg if values exist).
+            // When the start arguments identify this server (+matchzy_config_scope or -port) that
+            // is safe now. Otherwise the scope depends on config.cfg or hostport, neither of which
+            // the engine has applied yet during Load, so wait for the first OnMapStart.
+            if (hotReload || ServerIdentity.HasCommandLineIdentity(processCommandLineArgs))
+            {
+                LoadPersistentConfig();
+            }
+            else
+            {
+                persistentConfigLoadPending = true;
+                Log($"[ConfigScope] No +matchzy_config_scope or -port in the start arguments (read from {commandLineSource}); loading persistent config after the server activates.");
+            }
+
             // Start event retry background process
             StartEventRetryTimer();
 
@@ -461,6 +480,8 @@ namespace MatchZy
             });
 
             AddCommandListener("noclip", OnConsoleNoClip); // Override noclip
+            // MAT "end warmup" sends a raw mp_warmup_end; route it through the start path in simulation.
+            AddCommandListener("mp_warmup_end", OnWarmupEndCommand);
 
             RegisterEventHandler<EventRoundEnd>((@event, info) =>
             {
@@ -535,10 +556,36 @@ namespace MatchZy
 
             RegisterListener<Listeners.OnMapStart>(mapName =>
             {
+                serverActivated = true;
+                if (persistentConfigLoadPending)
+                {
+                    persistentConfigLoadPending = false;
+                    LoadPersistentConfig();
+
+                    // The startup timers in Load may already have run without these values.
+                    AddTimer(2.0f, () => TryBootstrapFetch("startup"));
+                    AddTimer(3.0f, () => StartMatHeartbeatTimerIfConfigured());
+                    AddTimer(5.0f, () =>
+                    {
+                        if (!string.IsNullOrEmpty(matchConfig.RemoteLogURL))
+                        {
+                            SendServerConfiguredEvent("Startup");
+                            SendServerHealthEvent("startup");
+                        }
+                    });
+                }
+
                 AddTimer(1.0f, () =>
                 {
                     if (!isMatchSetup)
                     {
+                        // A map change without a server restart keeps the convars. With no
+                        // match loaded, publish idle (clearing any stale match id) before the
+                        // autostart mode sets its own state; sleep/practice publish nothing.
+                        if (!TournamentStatusLogic.HasActiveMatch(isMatchSetup, tournamentStatus.Value, null))
+                        {
+                            UpdateTournamentStatus(TournamentStatusLogic.Idle);
+                        }
                         AutoStart();
                         return;
                     }
