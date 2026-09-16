@@ -125,7 +125,7 @@ namespace MatchZy
                 return;
             }
 
-            Log($"[LoadMatchDataCommand] Match setup request received with URL: {url} headerName: {headerName} and headerValue: {headerValue}");
+            Log($"[LoadMatchDataCommand] Match setup request received with URL: {SecretRedactor.RedactText(url)} header: {SecretRedactor.FormatCustomHeader(headerName, headerValue)}");
 
             if (!IsValidUrl(url))
             {
@@ -146,7 +146,7 @@ namespace MatchZy
                 if (response.IsSuccessStatusCode)
                 {
                     string jsonData = response.Content.ReadAsStringAsync().Result;
-                    Log($"[LoadMatchFromURL] Received following data: {jsonData}");
+                    Log($"[LoadMatchFromURL] Received following data: {SecretRedactor.RedactText(jsonData)}");
 
                     bool success = LoadMatchFromJSON(jsonData);
                     if (!success)
@@ -231,9 +231,10 @@ namespace MatchZy
 
             // The current series is still finishing; step back from "queued" so the
             // allocator does not wait for a load that will no longer happen.
-            if (isMatchSetup && string.Equals(tournamentStatus.Value, "queued", StringComparison.OrdinalIgnoreCase))
+            if (string.Equals(tournamentStatus.Value, "queued", StringComparison.OrdinalIgnoreCase))
             {
-                UpdateTournamentStatus("postgame");
+                // Without a match there is no series to finish: go straight back to idle.
+                UpdateTournamentStatus(isMatchSetup ? "postgame" : TournamentStatusLogic.IdleStatus(isWarmup));
             }
 
             Log($"[MatchQueue] Cleared queued match {identifier ?? "unknown"} ({reason}).");
@@ -246,6 +247,14 @@ namespace MatchZy
             if (player != null) return;
 
             string? cleared = ClearQueuedMatch("matchzy_clear_queued_match");
+
+            // With no match on the server this is an idle server: make sure the status convars
+            // say so, so MAT can allocate it again even if a stale match id was left behind.
+            if (!isMatchSetup)
+            {
+                UpdateTournamentStatus(TournamentStatusLogic.IdleStatus(isWarmup));
+            }
+
             if (cleared == null)
             {
                 ReplyToUserCommand(player, "[MatchQueue] No queued match to clear. cleared_queued_match=none");
@@ -299,7 +308,7 @@ namespace MatchZy
                 if (response.IsSuccessStatusCode)
                 {
                     string jsonData = response.Content.ReadAsStringAsync().Result;
-                    Log($"[LoadQueuedMatch] Received following data for queued match: {jsonData}");
+                    Log($"[LoadQueuedMatch] Received following data for queued match: {SecretRedactor.RedactText(jsonData)}");
 
                     bool success = LoadMatchFromJSON(jsonData);
                     if (!success)
@@ -454,6 +463,8 @@ namespace MatchZy
 
             // Update tournament status to loading with match ID
             UpdateTournamentStatus("loading", liveMatchId.ToString());
+            // A new match starts from the operator's restart delay, not a previous match's GOTV raise.
+            RestoreMatchRestartDelay("match load");
             JToken team1 = jsonDataObject["team1"]!;
             JToken team2 = jsonDataObject["team2"]!;
             JToken maplist = jsonDataObject["maplist"]!;
@@ -566,7 +577,17 @@ namespace MatchZy
             string currentMapName = Server.MapName;
             string mapName = matchConfig.Maplist[0];
 
-            bool willChangeMap = IsMapReloadRequiredForGameMode(matchConfig.Wingman) || mapReloadRequired || currentMapName != mapName;
+            // After a server restart the server can already be on the match map with no SourceTV
+            // master (created only on map load with tv_enable 1). Without a reload tv_record then
+            // writes nothing and the first match's demo is lost (QA: match 62, file_not_found).
+            bool sourceTvReloadRequired = DemoFileLocator.RequiresMapReloadForSourceTv(isDemoRecordingEnabled, IsSourceTvActive());
+            if (sourceTvReloadRequired)
+            {
+                Log("[LoadMatch] Demo recording is enabled but no SourceTV master is running; forcing tv_enable 1 and reloading the map so demos are recorded.");
+                Server.ExecuteCommand("tv_enable 1");
+            }
+
+            bool willChangeMap = IsMapReloadRequiredForGameMode(matchConfig.Wingman) || mapReloadRequired || currentMapName != mapName || sourceTvReloadRequired;
 
             if (willChangeMap)
             {

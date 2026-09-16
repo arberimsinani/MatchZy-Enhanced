@@ -15,7 +15,7 @@ namespace MatchZy
 
         public override string ModuleName => "MatchZy";
 
-        public override string ModuleVersion => "1.4.27";
+        public override string ModuleVersion => "1.4.32";
 
         public override string ModuleAuthor => "sivert (https://github.com/sivert-io/)";
 
@@ -480,6 +480,8 @@ namespace MatchZy
             });
 
             AddCommandListener("noclip", OnConsoleNoClip); // Override noclip
+            // MAT "end warmup" sends a raw mp_warmup_end; route it through the start path in simulation.
+            AddCommandListener("mp_warmup_end", OnWarmupEndCommand);
 
             RegisterEventHandler<EventRoundEnd>((@event, info) =>
             {
@@ -577,6 +579,13 @@ namespace MatchZy
                 {
                     if (!isMatchSetup)
                     {
+                        // A map change without a server restart keeps the convars. With no
+                        // match loaded, publish idle (clearing any stale match id) before the
+                        // autostart mode sets its own state; sleep/practice publish nothing.
+                        if (!TournamentStatusLogic.HasActiveMatch(isMatchSetup, tournamentStatus.Value, null))
+                        {
+                            UpdateTournamentStatus(TournamentStatusLogic.Idle);
+                        }
                         AutoStart();
                         return;
                     }
