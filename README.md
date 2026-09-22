@@ -207,6 +207,15 @@ Built with [CounterStrikeSharp](https://github.com/roflmuffin/CounterStrikeSharp
 
 </div>
 
+## Releasing this fork
+
+`release.sh` bumps `ModuleVersion`, builds, commits, tags and publishes the
+zip. On GitHub it runs from the **Release** workflow: the *Run workflow*
+button with a bump type, or -- for an environment that can push branches but
+not press the button -- a push of a branch named `release/patch`,
+`release/minor` or `release/major`. Either way the release is cut on `dev`;
+the branch is only the trigger and the job deletes it when it is done.
+
 ## Changes in this fork
 
 This is [cs2-xpbot](https://github.com/arberimsinani/cs2-xpbot)'s fork of
