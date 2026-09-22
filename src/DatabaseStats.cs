@@ -528,6 +528,30 @@ namespace MatchZy
         }
 
         /// <summary>
+        /// How many events of this server are still waiting to be delivered, for the health
+        /// endpoint. -1 when the count could not be read, so a database problem shows up as
+        /// unknown rather than as an empty queue.
+        /// </summary>
+        public int CountPendingEvents()
+        {
+            try
+            {
+                using IDbConnection connection = OpenConnection();
+                return connection.ExecuteScalar<int>($@"
+                    SELECT COUNT(*)
+                    FROM matchzy_event_queue
+                    WHERE status = 'pending'
+                    AND {PersistentConfigStore.PendingEventsScopeClause}
+                ", new { Scope = ServerScope, LegacyScope = ServerIdentity.LegacyScope });
+            }
+            catch (Exception ex)
+            {
+                Log($"[CountPendingEvents] Error: {ex.Message}");
+                return -1;
+            }
+        }
+
+        /// <summary>
         /// Marks an event as successfully sent
         /// </summary>
         public void MarkEventSent(int eventId)

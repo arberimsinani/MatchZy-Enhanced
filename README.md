@@ -219,6 +219,20 @@ changes below on top, each written to be offered upstream.
   recording without an upload URL waited `tv_delay + 25` s against the game's
   25 s default, and the game loaded the next map of the map group first, with
   the demo still being written.
+- **A health endpoint.** From v1.4.34 the plugin answers `GET /health` with
+  its version, config scope, uptime, map, the match it has loaded and its
+  status, its database check, its event queue and a verdict of its own, so a
+  control plane can ask the plugin whether it is loaded and working instead of
+  reading the server's journal for a `LOADED` line. It listens on the
+  abstract Unix socket `@matchzy-health-<scope>` from the moment it loads,
+  with no configuration (`curl --abstract-unix-socket matchzy-health-<scope>
+  http://matchzy/health` on the host; the scope is `matchzy_config_scope`,
+  or `host:port` without one), and on TCP when `matchzy_health_port` names a
+  port — bound to `127.0.0.1`, or to `matchzy_health_bind`. The report is
+  captured on the game thread every 2 s and served from a background thread,
+  so `snapshot_age_seconds` past 20 means the game thread has stopped: the
+  plugin reports that, and a database it cannot reach, as `problems` with
+  `ok: false`. The reply carries no secrets.
 - **`css_forcewin <team1|team2>`** ends the map being played with the given
   team as its winner and lets the normal match-end path run: series score,
   clinch, demo and map change. `css_endmatch` drops the whole loaded series;

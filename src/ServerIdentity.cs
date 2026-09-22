@@ -140,6 +140,9 @@ public static class ServerIdentity
     /// <summary>Command line flags that carry an explicit scope override.</summary>
     private static readonly string[] ScopeFlags = { "+matchzy_config_scope", "-matchzy_config_scope" };
 
+    /// <summary>Command line flags that carry the TCP port of the health endpoint.</summary>
+    private static readonly string[] HealthPortFlags = { "+matchzy_health_port", "-matchzy_health_port" };
+
     /// <summary>
     /// Full resolution, see the class summary for the order. <see cref="ScopeResolution.IsFinal"/>
     /// is false only when the result could still improve once the server activates (no explicit
@@ -288,6 +291,20 @@ public static class ServerIdentity
     /// <c>+matchzy_config_scope=&lt;name&gt;</c>). Null when absent or empty.
     /// </summary>
     public static string? ParseScopeOverride(string[]? args) => ValueOfFlag(args, ScopeFlags);
+
+    /// <summary>
+    /// Reads <c>+matchzy_health_port &lt;port&gt;</c> from the start arguments. Read from argv
+    /// for the same reason the scope is: a <c>+cvar</c> on the launch line runs before the plugin
+    /// registers the convar, so the value never reaches it that way. Null when absent or not a
+    /// valid port; 0 is returned as 0 so a launch line can switch the endpoint off explicitly.
+    /// </summary>
+    public static int? ParseHealthPort(string[]? args)
+    {
+        string? raw = ValueOfFlag(args, HealthPortFlags);
+        if (raw == null) return null;
+        if (!int.TryParse(raw, NumberStyles.None, CultureInfo.InvariantCulture, out int port)) return null;
+        return port <= 65535 ? port : null;
+    }
 
     /// <summary>
     /// Normalises a scope so the same server always produces byte-identical rows: trimmed,
