@@ -57,6 +57,38 @@ namespace MatchZy
             }
         }
 
+        /// <summary>
+        /// Map-change breadcrumb (matchzy_crash_debug_breadcrumbs). Adds the state that
+        /// matters for "crashes on map change with 5+ players / long uptime" reports:
+        /// how many controllers the plugin still holds from the previous map, coaches,
+        /// pending per-player timers, and process memory / uptime for leak hunting.
+        /// Only counts are read; no entity is touched here.
+        /// </summary>
+        private void MapTransitionBreadcrumb(string step)
+        {
+            if (!crashDebugBreadcrumbs.Value) return;
+
+            string stats;
+            try
+            {
+                using var process = System.Diagnostics.Process.GetCurrentProcess();
+                double uptimeMinutes = (DateTime.Now - process.StartTime).TotalMinutes;
+                long workingSetMb = process.WorkingSet64 / (1024 * 1024);
+                long managedMb = GC.GetTotalMemory(false) / (1024 * 1024);
+                stats = $"trackedPlayers={playerData.Count} readyEntries={playerReadyStatus.Count} " +
+                        $"coaches={matchzyTeam1.coach.Count + matchzyTeam2.coach.Count} " +
+                        $"autoReadyTimers={autoReadyPendingReadyTimers.Count} practiceTimers={playerTimers.Count} " +
+                        $"matchSetup={isMatchSetup} live={isMatchLive} practice={isPractice} sim={isSimulationMode} " +
+                        $"uptimeMin={uptimeMinutes:0} workingSetMB={workingSetMb} managedMB={managedMb}";
+            }
+            catch (Exception e)
+            {
+                stats = $"stats unavailable: {e.Message}";
+            }
+
+            CrashBreadcrumb($"{step} | {stats}");
+        }
+
         private void PrintToPlayerChat(CCSPlayerController player, string message)
         {
             player.PrintToChat($"{chatPrefix} {message}");
@@ -1669,44 +1701,54 @@ namespace MatchZy
                 return;
             }
 
-            if (!long.TryParse(mapName, out _) && !mapName.Contains('_'))
+            if (!ExecuteMapChange(mapName, "MapChange"))
             {
-                mapName = "de_" + mapName;
+                ReplyToUserCommand(player, Localizer["matchzy.cc.invalidmap"]);
+            }
+        }
+
+        private readonly WorkshopMapRegistry workshopMaps = new();
+
+        /// <summary>
+        /// Changes to a map given as an installed map name, a workshop id / path / URL,
+        /// or the name of a workshop map. Returns false when the input is unusable.
+        /// </summary>
+        private bool ExecuteMapChange(string? mapInput, string logTag)
+        {
+            var (kind, arg) = MapTargetLogic.Resolve(mapInput, Server.IsMapValid, workshopMaps.IdFor);
+            if (kind == MapChangeKind.Invalid)
+            {
+                Log($"[{logTag}] Refusing map change to '{mapInput}': not a map name or workshop id.");
+                return false;
             }
 
-            if (long.TryParse(mapName, out _))
-            { // Check if mapName is a long for workshop map ids
-                if (!isSimulationMode)
-                {
-                    Log("[MapChange] Executing bot_kick before host_workshop_map (non-simulation match).");
-                    Server.ExecuteCommand("bot_kick");
-                }
-                else
-                {
-                    Log("[MapChange] Skipping bot_kick before host_workshop_map because simulation mode is active.");
-                }
-
-                Server.ExecuteCommand($"host_workshop_map \"{mapName}\"");
-            }
-            else if (Server.IsMapValid(mapName))
+            string command = kind switch
             {
-                if (!isSimulationMode)
-                {
-                    Log("[MapChange] Executing bot_kick before changelevel (non-simulation match).");
-                    Server.ExecuteCommand("bot_kick");
-                }
-                else
-                {
-                    Log("[MapChange] Skipping bot_kick before changelevel because simulation mode is active.");
-                }
+                MapChangeKind.WorkshopId => "host_workshop_map",
+                MapChangeKind.WorkshopName => "ds_workshop_changelevel",
+                _ => "changelevel",
+            };
 
-                Server.ExecuteCommand($"changelevel \"{mapName}\"");
+            if (!isSimulationMode)
+            {
+                Log($"[{logTag}] Executing bot_kick before {command} (non-simulation match).");
+                Server.ExecuteCommand("bot_kick");
             }
             else
             {
-                ReplyToUserCommand(player, $"Invalid map name!");
+                Log($"[{logTag}] Skipping bot_kick before {command} because simulation mode is active.");
             }
+
+            if (kind == MapChangeKind.WorkshopId) workshopMaps.MarkPending(arg);
+            MapTransitionBreadcrumb($"MapChange[{logTag}]: {command} {arg} (from {Server.MapName})");
+            Log($"[{logTag}] {command} {arg} (input: '{mapInput}')");
+            Server.ExecuteCommand($"{command} \"{arg}\"");
+            return true;
         }
+
+        /// <summary>Whether the server is on this map (name, or the workshop id that loaded it).</summary>
+        private bool IsOnMap(string? mapInput) =>
+            MapTargetLogic.IsCurrentMap(mapInput, Server.MapName, workshopMaps.IdFor);
 
         private void HandleReadyRequiredCommand(CCSPlayerController? player, string commandArg)
         {
@@ -2454,31 +2496,9 @@ namespace MatchZy
             Log($"[ChangeMap] Changing map to {mapName} with delay {delay}");
             AddTimer(delay, () =>
             {
-                if (long.TryParse(mapName, out _))
+                if (!ExecuteMapChange(mapName, "ChangeMap"))
                 {
-                    if (!isSimulationMode)
-                    {
-                        Log("[ChangeMap] Executing bot_kick before host_workshop_map (non-simulation match).");
-                        Server.ExecuteCommand("bot_kick");
-                    }
-                    else
-                    {
-                        Log("[ChangeMap] Skipping bot_kick before host_workshop_map because simulation mode is active.");
-                    }
-                    Server.ExecuteCommand($"host_workshop_map \"{mapName}\"");
-                }
-                else if (Server.IsMapValid(mapName))
-                {
-                    if (!isSimulationMode)
-                    {
-                        Log("[ChangeMap] Executing bot_kick before changelevel (non-simulation match).");
-                        Server.ExecuteCommand("bot_kick");
-                    }
-                    else
-                    {
-                        Log("[ChangeMap] Skipping bot_kick before changelevel because simulation mode is active.");
-                    }
-                    Server.ExecuteCommand($"changelevel \"{mapName}\"");
+                    Log($"[ChangeMap] Map change to '{mapName}' was not issued.");
                 }
             });
         }

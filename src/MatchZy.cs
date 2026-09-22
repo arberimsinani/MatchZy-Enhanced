@@ -559,9 +559,25 @@ namespace MatchZy
             //     return HookResult.Continue;
             // });
 
+            RegisterListener<Listeners.OnMapEnd>(() =>
+            {
+                MapTransitionBreadcrumb($"OnMapEnd: {Server.MapName}");
+
+                // The 10 Hz practice !timer display reads a cached controller and its pawn.
+                // Controllers from the ending map must not be touched on the next one, so
+                // stop those timers here (they are also STOP_ON_MAPCHANGE).
+                foreach (var practiceTimer in playerTimers.Values)
+                {
+                    practiceTimer.KillTimer();
+                }
+                playerTimers.Clear();
+            });
+
             RegisterListener<Listeners.OnMapStart>(mapName =>
             {
+                MapTransitionBreadcrumb($"OnMapStart: {mapName}");
                 serverActivated = true;
+                workshopMaps.OnMapStarted(mapName);
                 if (persistentConfigLoadPending)
                 {
                     persistentConfigLoadPending = false;
@@ -583,6 +599,7 @@ namespace MatchZy
 
                 AddTimer(1.0f, () =>
                 {
+                    MapTransitionBreadcrumb($"OnMapStart+1s: {Server.MapName}");
                     if (!isMatchSetup)
                     {
                         // A map change without a server restart keeps the convars. With no
@@ -688,16 +705,27 @@ namespace MatchZy
                 var messageCommandArg = parts.Length > 1 ? string.Join(' ', parts.Skip(1)) : string.Empty;
 
                 CCSPlayerController? player = null;
-                if (playerData.TryGetValue(playerUserId, out CCSPlayerController? value))
+                if (playerData.TryGetValue(playerUserId, out CCSPlayerController? value) && value != null && value.IsValid)
                 {
                     player = value;
                 }
 
                 if (player == null)
                 {
-                    // Somehow we did not had the player in playerData, hence updating the maps again before getting the player
+                    // Somehow we did not had the player in playerData (or only a stale controller), hence updating the maps again before getting the player
                     UpdatePlayersMap();
-                    player = playerData[playerUserId];
+                    if (!playerData.TryGetValue(playerUserId, out player) || player == null || !player.IsValid)
+                    {
+                        // Still not tracked (e.g. the refresh skipped them). Resolve the live controller
+                        // instead of throwing: a KeyNotFoundException here silently dropped chat
+                        // commands such as .ready.
+                        player = Utilities.GetPlayerFromUserid(playerUserId);
+                    }
+                    if (player == null || !player.IsValid)
+                    {
+                        Log($"[EventPlayerChat] Could not resolve a controller for UserId={playerUserId}; ignoring \"{message}\".");
+                        return HookResult.Continue;
+                    }
                 }
 
                 // Handling player commands

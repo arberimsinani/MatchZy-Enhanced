@@ -418,7 +418,7 @@ namespace MatchZy
                         }
                         if (field == "num_maps" && numMaps > jsonData["maplist"]!.ToObject<List<string>>()!.Count)
                         {
-                            return $"{field} should be equal to or greater than maplist!";
+                            return $"{field} should be less than or equal to the number of maps in maplist!";
                         }
 
                         break;
@@ -626,7 +626,6 @@ namespace MatchZy
                 }
             }
 
-            string currentMapName = Server.MapName;
             string mapName = matchConfig.Maplist[0];
 
             // After a server restart the server can already be on the match map with no SourceTV
@@ -639,7 +638,7 @@ namespace MatchZy
                 Server.ExecuteCommand("tv_enable 1");
             }
 
-            bool willChangeMap = IsMapReloadRequiredForGameMode(matchConfig.Wingman) || mapReloadRequired || currentMapName != mapName || sourceTvReloadRequired;
+            bool willChangeMap = IsMapReloadRequiredForGameMode(matchConfig.Wingman) || mapReloadRequired || !IsOnMap(mapName) || sourceTvReloadRequired;
 
             if (willChangeMap)
             {
