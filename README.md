@@ -219,6 +219,16 @@ changes below on top, each written to be offered upstream.
   recording without an upload URL waited `tv_delay + 25` s against the game's
   25 s default, and the game loaded the next map of the map group first, with
   the demo still being written.
+- **One `.ready` per team.** A loaded match goes live once one player on each
+  team has typed `.ready` (and the rosters are full), not once every player
+  has. A config's `min_players_to_ready` still overrides it, `0` meaning
+  everyone on the team, and `!readyrequired` still sets it from the console.
+  The unready reminder names only the teams still holding the match up.
+- **The damage report counts health taken, not weapon damage.** CS2's
+  `player_hurt` reports what the weapon dealt, so an AWP shot on a player at
+  40 HP was reported as 100+ and a report could say 140 in 1 hit. Each hit is
+  now measured against the health the victim had, so a player's damage to
+  one opponent in a round never exceeds 100.
 - **A health endpoint.** From v1.4.34 the plugin answers `GET /health` with
   its version, config scope, uptime, map, the match it has loaded and its
   status, its database check, its event queue and a verdict of its own, so a

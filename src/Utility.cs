@@ -517,10 +517,22 @@ namespace MatchZy
             if (!isWarmup || matchStarted) return;
             List<string> unreadyPlayers = new();
 
+            // With one .ready per team enough, a team that already has it is not holding the
+            // match up, so its other players are not nagged as unready.
+            HashSet<int> readyTeams = new();
+            if (isMatchSetup)
+            {
+                foreach (int team in new[] { (int)CsTeam.CounterTerrorist, (int)CsTeam.Terrorist, (int)CsTeam.Spectator })
+                {
+                    if (IsTeamReady(team)) readyTeams.Add(team);
+                }
+            }
+
             foreach (var kvp in playerData)
             {
                 var player = kvp.Value;
                 if (player == null || !player.IsValid || player.IsHLTV) continue;
+                if (readyTeams.Contains(player.TeamNum)) continue;
 
                 bool isReady = playerReadyStatus.TryGetValue(kvp.Key, out bool ready) && ready;
                 if (!isReady)

@@ -19,6 +19,21 @@ public static class MatchLogic
     public const float MaxSimulationTimeScale = 10.0f;
 
     /// <summary>
+    /// Players per team who must type .ready for a loaded match to go live when the config does
+    /// not say: one. A LAN's captains ready their teams; making all ten type it is how a match
+    /// sits in warmup with nine ready and one player in the toilet.
+    /// </summary>
+    public const int DefaultMinPlayersToReady = 1;
+
+    /// <summary>
+    /// The per-team ready threshold a loaded match starts with, before the config's own
+    /// min_players_to_ready (0 = everyone on the team) overrides it. The console's
+    /// !readyrequired value applies when it was set; otherwise the default above.
+    /// </summary>
+    public static int MinPlayersToReadyForLoadedMatch(int consoleMinimumReadyRequired) =>
+        consoleMinimumReadyRequired > 0 ? consoleMinimumReadyRequired : DefaultMinPlayersToReady;
+
+    /// <summary>
     /// Map winner from the final score. A tied score is resolved by the tiebreak
     /// slot when one was computed; otherwise the map is a draw ("none").
     /// </summary>
