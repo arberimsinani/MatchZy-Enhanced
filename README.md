@@ -238,6 +238,13 @@ changes below on top, each written to be offered upstream.
   40 HP was reported as 100+ and a report could say 140 in 1 hit. Each hit is
   now measured against the health the victim had, so a player's damage to
   one opponent in a round never exceeds 100.
+- **The Steam update check is off by default** (`matchzy_safeautoupdater_enabled`).
+  [cs2-server-agent](https://github.com/arberimsinani/cs2-server-agent) owns
+  CS2 updates for the whole host, xpbot ignores the events the check emits,
+  and a LAN box without internet only logged an offline warning from it every
+  half hour. The rest of upstream's Auto Tournament integration (heartbeat,
+  bootstrap, admins refresh, match report) is left in place and stays inert
+  until its URL is configured, so upstream fixes keep merging cleanly.
 - **Nothing waits on the network or the database on the game thread.** The
   match config (`matchzy_loadmatch_url`), a queued match and a backup restore
   from a URL were fetched with a blocking call on the game thread and

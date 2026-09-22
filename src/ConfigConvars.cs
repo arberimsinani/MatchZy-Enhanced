@@ -46,11 +46,13 @@ namespace MatchZy
         // and map changes (map change issued, OnMapEnd, OnMapStart, with player/timer counts and memory).
         public FakeConVar<bool> crashDebugBreadcrumbs = new("matchzy_crash_debug_breadcrumbs", "When enabled, writes phase-transition and map-change breadcrumbs to cfg/MatchZy/logs/matchzy_breadcrumbs.log to help diagnose crashes. Default: false", false);
         
-        // MatchZy-safe CS2 update checks (Steam UpToDateCheck)
+        // MatchZy-safe CS2 update checks (Steam UpToDateCheck). Off by default in this fork:
+        // cs2-server-agent owns CS2 updates for the whole host, xpbot ignores the events this
+        // emits, and a LAN box without internet only ever logs an offline warning from it.
         public FakeConVar<bool> safeAutoUpdaterEnabled = new(
             "matchzy_safeautoupdater_enabled",
-            "When enabled, periodically checks Steam UpToDateCheck and emits update markers/events. Shutdown behavior is controlled by matchzy_safeautoupdater_action. Default: true",
-            true
+            "When enabled, periodically checks Steam UpToDateCheck and emits update markers/events. Shutdown behavior is controlled by matchzy_safeautoupdater_action. Default: false",
+            false
         );
         public FakeConVar<string> safeAutoUpdaterAction = new(
             "matchzy_safeautoupdater_action",
