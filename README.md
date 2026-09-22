@@ -238,6 +238,14 @@ changes below on top, each written to be offered upstream.
   40 HP was reported as 100+ and a report could say 140 in 1 hit. Each hit is
   now measured against the health the victim had, so a player's damage to
   one opponent in a round never exceeds 100.
+- **Nothing waits on the network or the database on the game thread.** The
+  match config (`matchzy_loadmatch_url`), a queued match and a backup restore
+  from a URL were fetched with a blocking call on the game thread and
+  HttpClient's 100 s default timeout: with the control plane down, the whole
+  server froze until it ran out. They are now fetched on the thread pool with
+  a 30 s timeout and applied on the next frame, and a second load requested
+  while one is in flight is refused rather than raced. The event retry loop's
+  queue read and the health endpoint's database check run on the pool too.
 - **A health endpoint.** From v1.4.34 the plugin answers `GET /health` with
   its version, config scope, uptime, map, the match it has loaded and its
   status, its database check, its event queue and a verdict of its own, so a

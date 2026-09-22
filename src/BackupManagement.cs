@@ -599,43 +599,42 @@ namespace MatchZy
                 Log($"[LoadBackupFromURL] Invalid URL: {url}. Please provide a valid URL to load the backup!");
                 return;
             }
-            try
+            FetchThenOnGameThread(url, headerName, headerValue, result =>
             {
-                HttpClient httpClient = new();
-                if (headerName != "")
+                try
                 {
-                    httpClient.DefaultRequestHeaders.Add(headerName, headerValue);
-                }
-                HttpResponseMessage response = httpClient.GetAsync(url).Result;
-
-                if (response.IsSuccessStatusCode)
-                {
-                    string jsonData = response.Content.ReadAsStringAsync().Result;
-                    Log($"[LoadBackupFromURL] Received following data: {SecretRedactor.RedactText(jsonData)}");
-                    string fileName = Guid.NewGuid().ToString() + ".json";
-                    string filePath = Path.Combine(Server.GameDirectory, "csgo", "MatchZyDataBackup", fileName);
-
-                    string? directoryPath = Path.GetDirectoryName(filePath);
-                    if (directoryPath != null && !Directory.Exists(directoryPath))
+                    if (result.Succeeded)
                     {
-                        Directory.CreateDirectory(directoryPath);
-                    }
-                    File.WriteAllText(filePath, jsonData);
-                    Log($"[LoadBackupFromURL] Data saved to: {filePath}");
+                        string jsonData = result.Body;
+                        Log($"[LoadBackupFromURL] Received following data: {SecretRedactor.RedactText(jsonData)}");
+                        string fileName = Guid.NewGuid().ToString() + ".json";
+                        string filePath = Path.Combine(Server.GameDirectory, "csgo", "MatchZyDataBackup", fileName);
 
-                    RestoreRoundBackup(player, fileName);
+                        string? directoryPath = Path.GetDirectoryName(filePath);
+                        if (directoryPath != null && !Directory.Exists(directoryPath))
+                        {
+                            Directory.CreateDirectory(directoryPath);
+                        }
+                        File.WriteAllText(filePath, jsonData);
+                        Log($"[LoadBackupFromURL] Data saved to: {filePath}");
+
+                        RestoreRoundBackup(player, fileName);
+                    }
+                    else if (result.StatusCode != null)
+                    {
+                        ReplyToUserCommand(player, Localizer["matchzy.mm.httprequestfailed", result.StatusCode]);
+                        Log($"[LoadBackupFromURL] HTTP request failed with status code: {result.StatusCode}");
+                    }
+                    else
+                    {
+                        Log($"[LoadBackupFromURL - FATAL] An error occured: {result.Error}");
+                    }
                 }
-                else
+                catch (Exception e)
                 {
-                    ReplyToUserCommand(player, Localizer["matchzy.mm.httprequestfailed", response.StatusCode]);
-                    Log($"[LoadBackupFromURL] HTTP request failed with status code: {response.StatusCode}");
+                    Log($"[LoadBackupFromURL - FATAL] An error occured: {e.Message}");
                 }
-            }
-            catch (Exception e)
-            {
-                Log($"[LoadBackupFromURL - FATAL] An error occured: {e.Message}");
-                return;
-            }
+            });
         }
 
         [ConsoleCommand("get5_listbackups", "List all the backups for the provided matchid")]

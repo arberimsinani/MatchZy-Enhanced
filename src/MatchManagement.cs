@@ -134,44 +134,94 @@ namespace MatchZy
                 Log($"[LoadMatchDataCommand] Invalid URL: {url}. Please provide a valid URL to load the match!");
                 return;
             }
-            try
+            if (matchLoadFetchInFlight)
             {
-                HttpClient httpClient = new();
-                if (headerName != "")
-                {
-                    httpClient.DefaultRequestHeaders.Add(headerName, headerValue);
-                }
-                HttpResponseMessage response = httpClient.GetAsync(url).Result;
-
-                if (response.IsSuccessStatusCode)
-                {
-                    string jsonData = response.Content.ReadAsStringAsync().Result;
-                    Log($"[LoadMatchFromURL] Received following data: {SecretRedactor.RedactText(jsonData)}");
-
-                    bool success = LoadMatchFromJSON(jsonData);
-                    if (!success)
-                    {
-                        // command.ReplyToCommand("Match load failed! Resetting current match");
-                        ReplyToUserCommand(player, Localizer["matchzy.mm.matchloadfailed"]);
-                        UpdateTournamentStatus("error");
-                        ResetMatch();
-                    }
-                    loadedConfigFile = url;
-                }
-                else
-                {
-                    // command.ReplyToCommand($"[LoadMatchFromURL] HTTP request failed with status code: {response.StatusCode}");
-                    ReplyToUserCommand(player, Localizer["matchzy.mm.httprequestfailed", response.StatusCode]);
-                    UpdateTournamentStatus("error");
-                    Log($"[LoadMatchFromURL] HTTP request failed with status code: {response.StatusCode}");
-                }
-            }
-            catch (Exception e)
-            {
-                Log($"[LoadMatchFromURL - FATAL] An error occured: {e.Message}");
-                UpdateTournamentStatus("error");
+                // The blocking fetch serialised two loads by freezing the server between them;
+                // now that it does not, the second is refused rather than raced.
+                ReplyToUserCommand(player, "[LoadMatchDataCommand] A match is already being loaded; wait for it to finish.");
+                Log("[LoadMatchDataCommand] A match load is already in flight; ignoring this request.");
                 return;
             }
+
+            matchLoadFetchInFlight = true;
+            FetchThenOnGameThread(url, headerName, headerValue, result =>
+            {
+                matchLoadFetchInFlight = false;
+                try
+                {
+                    if (isMatchSetup)
+                    {
+                        // Something set a match up while the config was on its way; the guard
+                        // at the top of this command would have refused, so refuse here too.
+                        Log("[LoadMatchFromURL] A match was set up while the config was being fetched; not loading it.");
+                        return;
+                    }
+                    if (result.Succeeded)
+                    {
+                        string jsonData = result.Body;
+                        Log($"[LoadMatchFromURL] Received following data: {SecretRedactor.RedactText(jsonData)}");
+
+                        bool success = LoadMatchFromJSON(jsonData);
+                        if (!success)
+                        {
+                            // command.ReplyToCommand("Match load failed! Resetting current match");
+                            ReplyToUserCommand(player, Localizer["matchzy.mm.matchloadfailed"]);
+                            UpdateTournamentStatus("error");
+                            ResetMatch();
+                        }
+                        loadedConfigFile = url;
+                    }
+                    else if (result.StatusCode != null)
+                    {
+                        // command.ReplyToCommand($"[LoadMatchFromURL] HTTP request failed with status code: {response.StatusCode}");
+                        ReplyToUserCommand(player, Localizer["matchzy.mm.httprequestfailed", result.StatusCode]);
+                        UpdateTournamentStatus("error");
+                        Log($"[LoadMatchFromURL] HTTP request failed with status code: {result.StatusCode}");
+                    }
+                    else
+                    {
+                        Log($"[LoadMatchFromURL - FATAL] An error occured: {result.Error}");
+                        UpdateTournamentStatus("error");
+                    }
+                }
+                catch (Exception e)
+                {
+                    Log($"[LoadMatchFromURL - FATAL] An error occured: {e.Message}");
+                    UpdateTournamentStatus("error");
+                }
+            });
+        }
+
+        /// <summary>
+        /// True from a match load's request until its config has been fetched and applied,
+        /// so a second load cannot start under the first.
+        /// </summary>
+        private bool matchLoadFetchInFlight = false;
+
+        private static readonly HttpClient remoteFetchClient = new() { Timeout = RemoteFetch.Timeout };
+
+        /// <summary>
+        /// Fetches a document on the thread pool and runs <paramref name="onGameThread"/> with
+        /// the outcome on the next frame. What follows a fetch touches the game, so it has to be
+        /// there; what the fetch itself does must not be.
+        /// </summary>
+        private void FetchThenOnGameThread(string url, string? headerName, string? headerValue, Action<RemoteFetchResult> onGameThread)
+        {
+            Task.Run(async () =>
+            {
+                RemoteFetchResult result = await RemoteFetch.FetchAsync(remoteFetchClient, url, headerName, headerValue).ConfigureAwait(false);
+                Server.NextFrame(() =>
+                {
+                    try
+                    {
+                        onGameThread(result);
+                    }
+                    catch (Exception e)
+                    {
+                        Log($"[FetchThenOnGameThread - FATAL] An error occured applying {SecretRedactor.RedactText(url)}: {e.Message}");
+                    }
+                });
+            });
         }
 
         /// <summary>
@@ -295,43 +345,45 @@ namespace MatchZy
 
             Log($"[MatchQueue] Attempting to auto-load queued match {identifier} from URL after reset: {url}");
 
-            try
+            matchLoadFetchInFlight = true;
+            FetchThenOnGameThread(url, headerName, headerValue, result =>
             {
-                HttpClient httpClient = new();
-                if (!string.IsNullOrEmpty(headerName))
+                matchLoadFetchInFlight = false;
+                try
                 {
-                    httpClient.DefaultRequestHeaders.Add(headerName, headerValue);
-                }
-
-                HttpResponseMessage response = httpClient.GetAsync(url).Result;
-
-                if (response.IsSuccessStatusCode)
-                {
-                    string jsonData = response.Content.ReadAsStringAsync().Result;
-                    Log($"[LoadQueuedMatch] Received following data for queued match: {SecretRedactor.RedactText(jsonData)}");
-
-                    bool success = LoadMatchFromJSON(jsonData);
-                    if (!success)
+                    if (result.Succeeded)
                     {
-                        Log("[LoadQueuedMatch] Queued match load failed. Keeping server in idle/error state.");
+                        string jsonData = result.Body;
+                        Log($"[LoadQueuedMatch] Received following data for queued match: {SecretRedactor.RedactText(jsonData)}");
+
+                        bool success = LoadMatchFromJSON(jsonData);
+                        if (!success)
+                        {
+                            Log("[LoadQueuedMatch] Queued match load failed. Keeping server in idle/error state.");
+                            UpdateTournamentStatus("error");
+                        }
+                        else
+                        {
+                            loadedConfigFile = url;
+                        }
+                    }
+                    else if (result.StatusCode != null)
+                    {
+                        Log($"[LoadQueuedMatch] HTTP request for queued match failed with status code: {result.StatusCode}");
                         UpdateTournamentStatus("error");
                     }
                     else
                     {
-                        loadedConfigFile = url;
+                        Log($"[LoadQueuedMatch - FATAL] An error occured while loading queued match: {result.Error}");
+                        UpdateTournamentStatus("error");
                     }
                 }
-                else
+                catch (Exception e)
                 {
-                    Log($"[LoadQueuedMatch] HTTP request for queued match failed with status code: {response.StatusCode}");
+                    Log($"[LoadQueuedMatch - FATAL] An error occured while loading queued match: {e.Message}");
                     UpdateTournamentStatus("error");
                 }
-            }
-            catch (Exception e)
-            {
-                Log($"[LoadQueuedMatch - FATAL] An error occured while loading queued match: {e.Message}");
-                UpdateTournamentStatus("error");
-            }
+            });
         }
 
         static string ValidateMatchJsonStructure(JObject jsonData)

@@ -22,6 +22,7 @@
     <Compile Include="..\..\src\MatchRestartDelayLogic.cs" Link="MatchRestartDelayLogic.cs" />
     <Compile Include="..\..\src\HealthEndpoint.cs" Link="HealthEndpoint.cs" />
     <Compile Include="..\..\src\DamageLogic.cs" Link="DamageLogic.cs" />
+    <Compile Include="..\..\src\RemoteFetch.cs" Link="RemoteFetch.cs" />
   </ItemGroup>
 
   <ItemGroup>

@@ -24,10 +24,11 @@ namespace MatchZy
         private volatile HealthSnapshot? healthSnapshot;
         private readonly long healthLoadedAt = DateTimeOffset.UtcNow.ToUnixTimeSeconds();
         private long healthLastDbCheckAt = 0;
-        private bool healthDbOk = true;
-        private string healthDbType = "";
-        private string? healthDbError;
-        private int? healthEventsQueued;
+        private volatile bool healthDbCheckInFlight = false;
+        private volatile HealthDbState healthDb = new(true, "", null, null);
+
+        /// <summary>The last database check, written whole by the pool thread that ran it.</summary>
+        private sealed record HealthDbState(bool Ok, string Type, string? Error, int? Queued);
         private string healthScope = "";
         private string healthScopeSource = "";
 
@@ -127,16 +128,34 @@ namespace MatchZy
             try
             {
                 long now = DateTimeOffset.UtcNow.ToUnixTimeSeconds();
-                if (now - healthLastDbCheckAt >= HealthProtocol.DatabaseCheckIntervalSeconds)
+                if (now - healthLastDbCheckAt >= HealthProtocol.DatabaseCheckIntervalSeconds && !healthDbCheckInFlight)
                 {
+                    // Opening a connection is a file open on SQLite and a TCP connect with a
+                    // 10 s timeout on MySQL; neither belongs on the game thread. The scope is
+                    // resolved here, where convars may be read, and the check runs on the pool
+                    // and publishes its result whole; the snapshot reads whatever is latest.
                     healthLastDbCheckAt = now;
-                    var (ok, dbType, error) = database.CheckHealth();
-                    healthDbOk = ok;
-                    healthDbType = dbType;
-                    healthDbError = ok ? null : error;
-                    int queued = ok ? database.CountPendingEvents() : -1;
-                    healthEventsQueued = queued < 0 ? null : queued;
+                    healthDbCheckInFlight = true;
+                    string scope = database.ServerScope;
+                    Task.Run(() =>
+                    {
+                        try
+                        {
+                            var (ok, dbType, error) = database.CheckHealth();
+                            int queued = ok ? database.CountPendingEvents(scope) : -1;
+                            healthDb = new HealthDbState(ok, dbType, ok ? null : error, queued < 0 ? null : queued);
+                        }
+                        catch (Exception ex)
+                        {
+                            healthDb = new HealthDbState(false, healthDb.Type, ex.Message, null);
+                        }
+                        finally
+                        {
+                            healthDbCheckInFlight = false;
+                        }
+                    });
                 }
+                var db = healthDb;
 
                 string map;
                 try { map = Server.MapName ?? ""; } catch { map = ""; }
@@ -156,12 +175,12 @@ namespace MatchZy
                     MapNumber = matchConfig.CurrentMapNumber,
                     Paused = isPaused,
                     Simulation = isSimulationMode,
-                    DatabaseOk = healthDbOk,
-                    DatabaseType = healthDbType,
-                    DatabaseError = healthDbError,
+                    DatabaseOk = db.Ok,
+                    DatabaseType = db.Type,
+                    DatabaseError = db.Error,
                     EventsEnabled = eventsEnabled.Value,
                     RemoteLogConfigured = !string.IsNullOrEmpty(matchConfig.RemoteLogURL),
-                    EventsQueued = healthEventsQueued,
+                    EventsQueued = db.Queued,
                     DemoUploadConfigured = !string.IsNullOrEmpty(demoUploadURL),
                 };
             }
