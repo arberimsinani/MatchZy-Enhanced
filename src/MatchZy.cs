@@ -181,12 +181,17 @@ namespace MatchZy
             if (hotReload || ServerIdentity.HasCommandLineIdentity(processCommandLineArgs))
             {
                 LoadPersistentConfig();
+                // The health socket is named after the scope, so it starts the moment the
+                // scope is final; otherwise it waits for OnMapStart with the config.
+                StartHealthEndpoint();
             }
             else
             {
                 persistentConfigLoadPending = true;
                 Log($"[ConfigScope] No +matchzy_config_scope or -port in the start arguments (read from {commandLineSource}); loading persistent config after the server activates.");
             }
+            healthPort.ValueChanged += (_, _) => StartHealthTcpEndpoint();
+            healthBind.ValueChanged += (_, _) => StartHealthTcpEndpoint();
 
             // Start event retry background process
             StartEventRetryTimer();
@@ -561,6 +566,7 @@ namespace MatchZy
                 {
                     persistentConfigLoadPending = false;
                     LoadPersistentConfig();
+                    StartHealthEndpoint();
 
                     // The startup timers in Load may already have run without these values.
                     AddTimer(2.0f, () => TryBootstrapFetch("startup"));
@@ -841,6 +847,14 @@ namespace MatchZy
             RegisterEventHandler<EventDecoyStarted>(EventDecoyDetonateHandler);
 
             Console.WriteLine($"[{ModuleName} v{ModuleVersion} LOADED] MatchZy Enhanced by {ModuleAuthor}");
+        }
+
+        public override void Unload(bool hotReload)
+        {
+            // The health listeners run on their own threads and hold a socket each; a hot
+            // reload would otherwise find the name taken and the old plugin still answering.
+            StopHealthEndpoint();
+            base.Unload(hotReload);
         }
     }
 }
