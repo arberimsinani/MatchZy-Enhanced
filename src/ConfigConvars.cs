@@ -42,14 +42,17 @@ namespace MatchZy
         public FakeConVar<bool> debugConsoleEnabled = new("matchzy_debug_console", "Whether to write verbose debug logs to the server console. Default: true", true);
 
         // Crash / transition breadcrumbs (writes checkpoints to console + a file)
-        // Useful when diagnosing CS2 segfaults during phase transitions (warmup -> knife/live).
-        public FakeConVar<bool> crashDebugBreadcrumbs = new("matchzy_crash_debug_breadcrumbs", "When enabled, writes transition breadcrumbs to MatchZy/logs/matchzy_breadcrumbs.log to help diagnose crashes. Default: false", false);
+        // Useful when diagnosing CS2 segfaults during phase transitions (warmup -> knife/live)
+        // and map changes (map change issued, OnMapEnd, OnMapStart, with player/timer counts and memory).
+        public FakeConVar<bool> crashDebugBreadcrumbs = new("matchzy_crash_debug_breadcrumbs", "When enabled, writes phase-transition and map-change breadcrumbs to cfg/MatchZy/logs/matchzy_breadcrumbs.log to help diagnose crashes. Default: false", false);
         
-        // MatchZy-safe CS2 update checks (Steam UpToDateCheck)
+        // MatchZy-safe CS2 update checks (Steam UpToDateCheck). Off by default in this fork:
+        // cs2-server-agent owns CS2 updates for the whole host, xpbot ignores the events this
+        // emits, and a LAN box without internet only ever logs an offline warning from it.
         public FakeConVar<bool> safeAutoUpdaterEnabled = new(
             "matchzy_safeautoupdater_enabled",
-            "When enabled, periodically checks Steam UpToDateCheck and emits update markers/events. Shutdown behavior is controlled by matchzy_safeautoupdater_action. Default: true",
-            true
+            "When enabled, periodically checks Steam UpToDateCheck and emits update markers/events. Shutdown behavior is controlled by matchzy_safeautoupdater_action. Default: false",
+            false
         );
         public FakeConVar<string> safeAutoUpdaterAction = new(
             "matchzy_safeautoupdater_action",
@@ -218,7 +221,7 @@ namespace MatchZy
             command.ReplyToCommand($"matchzy_knife_enabled_default = {(isKnifeRequired ? 1 : 0)}");
         }
 
-        [ConsoleCommand("matchzy_playout_enabled_default", "Whether knife round is enabled by default or not. Default value: true")]
+        [ConsoleCommand("matchzy_playout_enabled_default", "Whether playout (playing out all rounds and disabling overtime/early clinch) is enabled by default or not. Default value: false")]
         public void MatchZyPlayoutConvar(CCSPlayerController? player, CommandInfo command)
         {
             if (player != null) return;
@@ -355,7 +358,7 @@ namespace MatchZy
             }
         }
 
-        [ConsoleCommand("matchzy_stop_command_available", "Whether .stop command is enabled or not (to restore the current round). Default value: false")]
+        [ConsoleCommand("matchzy_stop_command_available", "Whether .stop command is enabled or not (to restore the current round). Default value: true")]
         public void MatchZyStopCommandEnabled(CCSPlayerController? player, CommandInfo command)
         {
             if (player != null) return;
@@ -418,7 +421,7 @@ namespace MatchZy
             database.SaveConfigValue("matchzy_chat_prefix", chatPrefix);
         }
 
-        [ConsoleCommand("matchzy_admin_chat_prefix", "Chat prefix to show whenever an admin sends message using .asay <message>. Default value: [{Green}MatchZy{Default}]")]
+        [ConsoleCommand("matchzy_admin_chat_prefix", "Chat prefix to show whenever an admin sends message using .asay <message>. Default value: [{Red}ADMIN{Default}]")]
         public void MatchZyAdminChatPrefix(CCSPlayerController? player, CommandInfo command)
         {
             if (player != null) return;
@@ -453,7 +456,7 @@ namespace MatchZy
             database.SaveConfigValue("matchzy_admin_chat_prefix", adminChatPrefix);
         }
 
-        [ConsoleCommand("matchzy_chat_messages_timer_delay", "Number of seconds of delay before sending reminder messages from MatchZy (like unready message, paused message, etc). Default: 12")]
+        [ConsoleCommand("matchzy_chat_messages_timer_delay", "Number of seconds of delay before sending reminder messages from MatchZy (like unready message, paused message, etc). Default: 13")]
         public void MatchZyChatMessagesTimerDelay(CCSPlayerController? player, CommandInfo command)
         {
             if (player != null) return;

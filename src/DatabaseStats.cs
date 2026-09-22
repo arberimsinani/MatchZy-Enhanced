@@ -498,10 +498,15 @@ namespace MatchZy
         /// <summary>
         /// Gets pending events ready for retry
         /// </summary>
-        public List<QueuedEvent> GetPendingEvents(int limit = 50)
+        /// <param name="scope">
+        /// This server's scope, captured on the game thread when the call is made off it:
+        /// resolving the scope reads convars, which only the game thread may do.
+        /// </param>
+        public List<QueuedEvent> GetPendingEvents(int limit = 50, string? scope = null)
         {
             try
             {
+                scope ??= ServerScope;
                 using IDbConnection connection = OpenConnection();
                 
                 string nowExpression = IsSqlite ? "datetime('now')" : "NOW()";
@@ -515,7 +520,7 @@ namespace MatchZy
                     AND retry_count < 20
                     ORDER BY created_at ASC
                     LIMIT {limit}
-                ", new { Scope = ServerScope, LegacyScope = ServerIdentity.LegacyScope }).ToList();
+                ", new { Scope = scope, LegacyScope = ServerIdentity.LegacyScope }).ToList();
                 
                 return events;
             }
@@ -532,17 +537,18 @@ namespace MatchZy
         /// endpoint. -1 when the count could not be read, so a database problem shows up as
         /// unknown rather than as an empty queue.
         /// </summary>
-        public int CountPendingEvents()
+        public int CountPendingEvents(string? scope = null)
         {
             try
             {
+                scope ??= ServerScope;
                 using IDbConnection connection = OpenConnection();
                 return connection.ExecuteScalar<int>($@"
                     SELECT COUNT(*)
                     FROM matchzy_event_queue
                     WHERE status = 'pending'
                     AND {PersistentConfigStore.PendingEventsScopeClause}
-                ", new { Scope = ServerScope, LegacyScope = ServerIdentity.LegacyScope });
+                ", new { Scope = scope, LegacyScope = ServerIdentity.LegacyScope });
             }
             catch (Exception ex)
             {

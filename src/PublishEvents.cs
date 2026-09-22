@@ -173,7 +173,12 @@ namespace MatchZy
                     return;
                 }
 
-                var pendingEvents = database.GetPendingEvents(50);
+                // The read used to run here, on the game thread, before the first await: on
+                // SQLite that is nothing, on a MySQL that has gone away it is a 10 s freeze
+                // every retry interval. The scope is resolved here, where convars may be read,
+                // and the query runs on the pool; the rest of this method already does.
+                string scope = database.ServerScope;
+                var pendingEvents = await Task.Run(() => database.GetPendingEvents(50, scope)).ConfigureAwait(false);
                 
                 if (pendingEvents.Count == 0)
                 {
