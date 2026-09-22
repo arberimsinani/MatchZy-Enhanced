@@ -11,6 +11,7 @@ namespace MatchZy
 
         private void InitPlayerDamageInfo()
         {
+            roundHealth.Reset();
             foreach (var key in playerData.Keys) {
                 if (!playerData[key].IsValid) continue;
                 if (playerData[key].IsBot) continue;
@@ -41,6 +42,12 @@ namespace MatchZy
         }
 
 		public Dictionary<int, Dictionary<int, DamagePlayerInfo>> playerDamageInfo = new Dictionary<int, Dictionary<int, DamagePlayerInfo>>();
+
+		// What each victim has left, hit by hit within the round. player_hurt reports the
+		// weapon's damage, which on an overkill is more than the victim had; the report counts
+		// the health that was actually taken, so a hit is measured against this.
+		private readonly RoundHealthTracker roundHealth = new();
+
 		private void UpdatePlayerDamageInfo(EventPlayerHurt @event, int targetId)
 		{
             CCSPlayerController? attacker = @event.Attacker;
@@ -53,7 +60,7 @@ namespace MatchZy
 			if (!attackerInfo.TryGetValue(targetId, out var targetInfo))
 				attackerInfo[targetId] = targetInfo = new DamagePlayerInfo();
 
-			targetInfo.DamageHP += @event.DmgHealth;
+			targetInfo.DamageHP += roundHealth.Hurt(targetId, @event.DmgHealth, @event.Health);
 			targetInfo.Hits++;
 		}
 

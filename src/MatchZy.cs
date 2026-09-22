@@ -141,7 +141,7 @@ namespace MatchZy
 
         // Game Config
         public bool isKnifeRequired = true;
-        public int minimumReadyRequired = 0; // Number of ready players required start the match. If set to 0, all connected players have to ready-up to start the match.
+        public int minimumReadyRequired = 0; // Number of ready players required start the match. If set to 0, all connected players have to ready-up to start the match (a loaded match config defaults to one per team instead, see MatchLogic.DefaultMinPlayersToReady).
         public bool isWhitelistRequired = false;
         public bool isSaveNadesAsGlobalEnabled = false;
 

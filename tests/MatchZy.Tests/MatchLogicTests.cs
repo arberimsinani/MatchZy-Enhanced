@@ -163,3 +163,29 @@ public class MatchLogicTests
         Assert.Equal(expected, MatchLogic.ClampSimulationTimeScale(requested));
     }
 }
+
+public class ReadyThresholdTests
+{
+    [Fact]
+    public void ALoadedMatchNeedsOneReadyPerTeamByDefault()
+    {
+        // QA: ten players had to type .ready; the match sat in warmup on the one who did not.
+        Assert.Equal(1, MatchLogic.DefaultMinPlayersToReady);
+        Assert.Equal(1, MatchLogic.MinPlayersToReadyForLoadedMatch(0));
+    }
+
+    [Theory]
+    [InlineData(1, 1)]
+    [InlineData(3, 3)]
+    [InlineData(5, 5)]
+    public void TheConsoleValueStillWinsWhenSet(int console, int expected)
+    {
+        Assert.Equal(expected, MatchLogic.MinPlayersToReadyForLoadedMatch(console));
+    }
+
+    [Fact]
+    public void ANegativeConsoleValueIsNotAThreshold()
+    {
+        Assert.Equal(1, MatchLogic.MinPlayersToReadyForLoadedMatch(-1));
+    }
+}

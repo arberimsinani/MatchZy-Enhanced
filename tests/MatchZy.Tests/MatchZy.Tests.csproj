@@ -21,6 +21,7 @@
     <Compile Include="..\..\src\DemoFileLocator.cs" Link="DemoFileLocator.cs" />
     <Compile Include="..\..\src\MatchRestartDelayLogic.cs" Link="MatchRestartDelayLogic.cs" />
     <Compile Include="..\..\src\HealthEndpoint.cs" Link="HealthEndpoint.cs" />
+    <Compile Include="..\..\src\DamageLogic.cs" Link="DamageLogic.cs" />
   </ItemGroup>
 
   <ItemGroup>
