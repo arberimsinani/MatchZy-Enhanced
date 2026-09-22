@@ -11,6 +11,16 @@ on:
           - patch
           - minor
           - major
+  # Second route for an environment that can push branches but cannot
+  # dispatch a workflow: a branch named release/patch, release/minor or
+  # release/major releases dev with that bump, exactly as the button would.
+  # The branch is only the trigger -- the release is cut on dev -- and the
+  # job deletes it afterwards so the next push to the same name fires again.
+  push:
+    branches:
+      - 'release/patch'
+      - 'release/minor'
+      - 'release/major'
 
 permissions:
   contents: write
@@ -20,9 +30,27 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
+      - name: Resolve bump
+        run: |
+          case "${GITHUB_EVENT_NAME}" in
+            workflow_dispatch) bump="${{ inputs.bump_type }}" ;;
+            push)              bump="${GITHUB_REF_NAME#release/}" ;;
+            *) echo "::error::unexpected trigger ${GITHUB_EVENT_NAME}"; exit 1 ;;
+          esac
+          case "$bump" in
+            patch|minor|major) ;;
+            *) echo "::error::bump must be patch, minor or major, got '$bump'"; exit 1 ;;
+          esac
+          echo "BUMP=$bump" >> "$GITHUB_ENV"
+          echo "releasing dev with a $bump bump"
+
+      # A branch push checks out dev rather than the trigger branch: release.sh
+      # commits the version bump and pushes the branch it is on, and that has to
+      # be the branch the release is made from.
       - name: Checkout repository
         uses: actions/checkout@v4
         with:
+          ref: ${{ github.event_name == 'push' && 'dev' || github.ref }}
           fetch-depth: 0
           token: ${{ secrets.GITHUB_TOKEN }}
 
@@ -49,4 +77,8 @@ jobs:
           # version bump. Skip the announcement only when the secret is absent;
           # setting it turns announcements back on with no change here.
           SKIP_DISCORD_WEBHOOK: ${{ secrets.DISCORD_WEBHOOK_URL == '' && '1' || '' }}
-        run: echo "y" | bash ./release.sh "${{ github.event.inputs.bump_type }}"
+        run: echo "y" | bash ./release.sh "${BUMP}"
+
+      - name: Remove the trigger branch
+        if: github.event_name == 'push'
+        run: git push origin --delete "${GITHUB_REF_NAME}"
