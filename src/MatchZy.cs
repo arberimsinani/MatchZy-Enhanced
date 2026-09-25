@@ -425,7 +425,23 @@ namespace MatchZy
                 if (isMatchSetup)
                 {
                     CsTeam playerTeam = GetPlayerTeam(player);
-                    SwitchPlayerTeam(player, playerTeam);
+                    CsTeam joined = (CsTeam)@event.Team;
+                    bool joinedSide = joined == CsTeam.CounterTerrorist || joined == CsTeam.Terrorist;
+                    // A player on no roster who landed on a side (auto-assign skips jointeam's
+                    // check) takes a place on that side's team if its roster is open.
+                    if (playerTeam == CsTeam.None && joinedSide && TryClaimOpenRosterPlace(player, joined))
+                    {
+                        playerTeam = GetPlayerTeam(player);
+                    }
+                    if (playerTeam == CsTeam.None && OpenRosterAdmits())
+                    {
+                        // Still on no roster: waiting for a place, so keep them off both sides.
+                        if (joinedSide) SwitchPlayerTeam(player, CsTeam.Spectator);
+                    }
+                    else
+                    {
+                        SwitchPlayerTeam(player, playerTeam);
+                    }
                 }
 
                 if (readyAvailable && !matchStarted && player.UserId.HasValue)
@@ -477,7 +493,13 @@ namespace MatchZy
                         int playerTeam = (int)GetPlayerTeam(player);
                         if (joiningTeam != playerTeam)
                         {
-                            return HookResult.Stop;
+                            // Open rosters: a player on no roster takes a place on the team on the
+                            // side they chose, and a claimed player may change team before live.
+                            CsTeam side = (CsTeam)joiningTeam;
+                            bool admitted = playerTeam == (int)CsTeam.None
+                                ? TryClaimOpenRosterPlace(player, side)
+                                : TryMoveOpenRosterPlace(player, side);
+                            return admitted ? HookResult.Continue : HookResult.Stop;
                         }
                     }
                 }

@@ -25,6 +25,7 @@
     <Compile Include="..\..\src\HealthEndpoint.cs" Link="HealthEndpoint.cs" />
     <Compile Include="..\..\src\DamageLogic.cs" Link="DamageLogic.cs" />
     <Compile Include="..\..\src\RemoteFetch.cs" Link="RemoteFetch.cs" />
+    <Compile Include="..\..\src\OpenRosterLogic.cs" Link="OpenRosterLogic.cs" />
   </ItemGroup>
 
   <ItemGroup>

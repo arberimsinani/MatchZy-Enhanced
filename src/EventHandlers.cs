@@ -52,7 +52,13 @@ public partial class MatchZy
                     }
 
                     CsTeam team = GetPlayerTeam(player);
-                    if (team == CsTeam.None)
+                    if (team == CsTeam.None && OpenRosterAdmits())
+                    {
+                        // An open roster still has a place: the player joins a team by taking its side.
+                        Log($"[EventPlayerConnectFull] {player.PlayerName} ({steamId}) is on no roster; an open roster has room, so they may take a side.");
+                        PrintToPlayerChat(player, "Join your team's side to take your place on its roster.");
+                    }
+                    else if (team == CsTeam.None)
                     {
                         Log($"[EventPlayerConnectFull] KICKING PLAYER STEAMID: {steamId}, Name: {player.PlayerName} (NOT ALLOWED!)");
                         PrintToAllChat($"Kicking player {player.PlayerName} - Not a player in this game.");
