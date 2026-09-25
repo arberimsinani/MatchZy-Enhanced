@@ -267,6 +267,16 @@ changes below on top, each written to be offered upstream.
   so `snapshot_age_seconds` past 20 means the game thread has stopped: the
   plugin reports that, and a database it cannot reach, as `problems` with
   `ok: false`. The reply carries no secrets.
+- **Open rosters.** A match config with `"open_rosters": true` lets a team be
+  sent by name alone: a team whose `players` object is empty takes its players
+  from whoever joins its side, up to `players_per_team`. A player on no roster
+  is no longer kicked while an open team still has a place; choosing that
+  team's side writes them into its roster (`<name> joins <team>` in chat), and
+  from then on they are that team's player as if the config had named them —
+  side swaps, the knife round, reconnects and the stats all follow the roster.
+  Until the match is live a player may move to the other team if it is open
+  too. A team that did send players stays locked to them, and without the flag
+  an empty roster kicks everyone, as before.
 - **`css_forcewin <team1|team2>`** ends the map being played with the given
   team as its winner and lets the normal match-end path run: series score,
   clinch, demo and map change. `css_endmatch` drops the whole loaded series;

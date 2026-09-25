@@ -90,6 +90,12 @@ namespace MatchZy
         [JsonPropertyName("simulation_timescale")]
         public float SimulationTimeScale { get; set; } = 1.0f;
 
+        // When true, a team whose "players" object is empty is an open roster: players on no
+        // roster may join its side and are added to it, up to players_per_team (see
+        // OpenRosterLogic). Optional and off by default, so an empty roster still kicks everyone.
+        [JsonPropertyName("open_rosters")]
+        public bool OpenRosters { get; set; } = false;
+
         [JsonPropertyName("match_side_type")]
         public string MatchSideType { get; set; } = "standard";
 

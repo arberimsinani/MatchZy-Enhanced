@@ -4,6 +4,7 @@ using CounterStrikeSharp.API.Core.Attributes.Registration;
 using Newtonsoft.Json.Linq;
 using System.Text.Json.Serialization;
 using CounterStrikeSharp.API;
+using CounterStrikeSharp.API.Modules.Utils;
 
 namespace MatchZy
 {
@@ -24,6 +25,12 @@ namespace MatchZy
 
         [JsonPropertyName("teamplayers")]
         public JToken? teamPlayers;
+
+        // An open roster (OpenRosterLogic): the config named no players and asked for
+        // open_rosters, so teamPlayers is filled by the players who join this team's side.
+        // Serialised with the team so a restored backup keeps both the flag and the claims.
+        [JsonPropertyName("openroster")]
+        public bool openRoster = false;
 
         [JsonIgnore, Newtonsoft.Json.JsonIgnore]
         public HashSet<CCSPlayerController> coach = [];
@@ -196,6 +203,80 @@ namespace MatchZy
                 }
             }
             return false;
+        }
+
+        // ---- Open rosters (OpenRosterLogic) ----
+
+        private static int RosterCount(JToken? players) => players is JObject o ? o.Count : 0;
+
+        private Team? TeamOnSide(CsTeam side)
+        {
+            string key = side == CsTeam.CounterTerrorist ? "CT" : side == CsTeam.Terrorist ? "TERRORIST" : "";
+            return key != "" && reverseTeamSides.TryGetValue(key, out var team) ? team : null;
+        }
+
+        /// <summary>
+        /// Whether a player on no roster may stay on the server: only while an open team
+        /// still has a place for them. Otherwise they are kicked as before.
+        /// </summary>
+        private bool OpenRosterAdmits() =>
+            OpenRosterLogic.Admits(
+                matchzyTeam1.openRoster, RosterCount(matchzyTeam1.teamPlayers),
+                matchzyTeam2.openRoster, RosterCount(matchzyTeam2.teamPlayers),
+                matchConfig.PlayersPerTeam);
+
+        /// <summary>
+        /// A player on no roster joining a side: if the team on that side is open and has
+        /// room, write them into its roster. Returns whether they now have a team.
+        /// </summary>
+        private bool TryClaimOpenRosterPlace(CCSPlayerController player, CsTeam side)
+        {
+            Team? team = TeamOnSide(side);
+            if (team == null) return false;
+
+            var decision = OpenRosterLogic.Decide(team.openRoster, RosterCount(team.teamPlayers), matchConfig.PlayersPerTeam);
+            if (decision == OpenRosterLogic.Claim.Full)
+            {
+                PrintToPlayerChat(player, $"{team.teamName} already has {matchConfig.PlayersPerTeam} players.");
+            }
+            if (decision != OpenRosterLogic.Claim.Take) return false;
+
+            team.teamPlayers ??= new JObject();
+            if (!AddPlayerToTeam(player.SteamID.ToString(), player.PlayerName, team.teamPlayers)) return false;
+
+            Log($"[OpenRoster] {player.PlayerName} ({player.SteamID}) joins {team.teamName} ({RosterCount(team.teamPlayers)}/{matchConfig.PlayersPerTeam}).");
+            PrintToAllChat($"{player.PlayerName} joins {team.teamName}.");
+            return true;
+        }
+
+        /// <summary>
+        /// A player who claimed a place on one open team joining the other team's side
+        /// before the match is live: move their claim. Returns whether they moved.
+        /// </summary>
+        private bool TryMoveOpenRosterPlace(CCSPlayerController player, CsTeam side)
+        {
+            Team? to = TeamOnSide(side);
+            if (to == null) return false;
+            Team from = to == matchzyTeam1 ? matchzyTeam2 : matchzyTeam1;
+
+            string steamId = player.SteamID.ToString();
+            if (from.teamPlayers is not JObject fromPlayers || fromPlayers[steamId] == null) return false;
+            if (!OpenRosterLogic.CanMove(matchStarted, from.openRoster, to.openRoster, RosterCount(to.teamPlayers), matchConfig.PlayersPerTeam))
+            {
+                return false;
+            }
+
+            to.teamPlayers ??= new JObject();
+            if (to.teamPlayers is not JObject toPlayers) return false;
+
+            JToken name = fromPlayers[steamId]!;
+            fromPlayers.Remove(steamId);
+            toPlayers.Add(steamId, name);
+            LoadClientNames();
+
+            Log($"[OpenRoster] {player.PlayerName} ({steamId}) moves from {from.teamName} to {to.teamName}.");
+            PrintToAllChat($"{player.PlayerName} joins {to.teamName}.");
+            return true;
         }
     }
 }

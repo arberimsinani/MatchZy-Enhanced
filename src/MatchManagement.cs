@@ -571,6 +571,16 @@ namespace MatchZy
                 matchConfig.RemoteLogHeaderValue = jsonDataObject["remote_log_header_value"]!.ToString();
             }
 
+            // A team sent with no players under open_rosters takes its players from its side.
+            // Set on every load: the Team objects outlive a match, and a previous match's flag
+            // must not open this one's roster.
+            matchzyTeam1.openRoster = OpenRosterLogic.IsOpen(matchConfig.OpenRosters, RosterCount(matchzyTeam1.teamPlayers));
+            matchzyTeam2.openRoster = OpenRosterLogic.IsOpen(matchConfig.OpenRosters, RosterCount(matchzyTeam2.teamPlayers));
+            if (matchzyTeam1.openRoster || matchzyTeam2.openRoster)
+            {
+                Log($"[LOADMATCH] Open rosters: team1={matchzyTeam1.openRoster} team2={matchzyTeam2.openRoster}; players on no roster join by taking a side, up to {matchConfig.PlayersPerTeam} per team.");
+            }
+
             // Track whether this match should be run in bot-driven simulation mode.
             isSimulationMode = matchConfig.Simulation;
 
@@ -832,6 +842,10 @@ namespace MatchZy
             if (jsonDataObject["simulation"] != null)
             {
                 matchConfig.Simulation = bool.Parse(jsonDataObject["simulation"]!.ToString());
+            }
+            if (jsonDataObject["open_rosters"] != null)
+            {
+                matchConfig.OpenRosters = bool.Parse(jsonDataObject["open_rosters"]!.ToString());
             }
             if (jsonDataObject["simulation_timescale"] != null)
             {

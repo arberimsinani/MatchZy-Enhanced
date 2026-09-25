@@ -1395,6 +1395,8 @@ namespace MatchZy
 
                 matchzyTeam1.teamPlayers = null;
                 matchzyTeam2.teamPlayers = null;
+                matchzyTeam1.openRoster = false;
+                matchzyTeam2.openRoster = false;
 
                 HashSet<CCSPlayerController> coaches = GetAllCoaches();
 
@@ -1569,7 +1571,7 @@ namespace MatchZy
                         if ((isMatchSetup || matchModeOnly) && !isSimulationBot)
                         {
                             CsTeam team = GetPlayerTeam(player);
-                            if (team == CsTeam.None && player.UserId.HasValue)
+                            if (team == CsTeam.None && player.UserId.HasValue && !OpenRosterAdmits())
                             {
                                 Log($"[UpdatePlayersMap] Executing kickid for player '{player.PlayerName}' (UserId={(ushort)player.UserId.Value}) because team=None in match-only mode (isSimulationMode={isSimulationMode}, IsBot={player.IsBot}).");
                                 Server.ExecuteCommand($"kickid {(ushort)player.UserId}");
