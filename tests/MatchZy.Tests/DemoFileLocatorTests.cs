@@ -32,7 +32,60 @@ public class DemoFileLocatorTests
     public void CandidateDirectoriesAreDistinctAndMostSpecificFirst()
     {
         var dirs = DemoFileLocator.CandidateDirectories(Csgo, $"{Csgo}/MatchZy/x.dem", "MatchZy/");
-        Assert.Equal(new[] { $"{Csgo}/MatchZy", Csgo }, dirs);
+        Assert.Equal(new[] { $"{Csgo}/MatchZy", $"{Csgo}/addons/metamod/MatchZy", Csgo, $"{Csgo}/addons/metamod" }, dirs);
+    }
+
+    // Issue #35: builds before 1.4.35 passed tv_record a relative path, and Metamod's search
+    // path put the demo in csgo/addons/metamod/<demo path>.
+    [Fact]
+    public void CandidateDirectoriesIncludeMetamodFolders()
+    {
+        var dirs = DemoFileLocator.CandidateDirectories(Csgo, $"{Csgo}/demos/x.dem", "demos");
+        Assert.Contains($"{Csgo}/addons/metamod/demos", dirs);
+        Assert.Contains($"{Csgo}/addons/metamod", dirs);
+        Assert.True(dirs.ToList().IndexOf($"{Csgo}/demos") < dirs.ToList().IndexOf($"{Csgo}/addons/metamod/demos"));
+    }
+
+    [Fact]
+    public void CandidateDirectoriesWithEmptyDemoPathHaveNoDuplicates()
+    {
+        var dirs = DemoFileLocator.CandidateDirectories(Csgo, $"{Csgo}/x.dem", "");
+        Assert.Equal(new[] { Csgo, $"{Csgo}/addons/metamod" }, dirs);
+    }
+
+    [Fact]
+    public void DemoRecordedUnderMetamodIsFound()
+    {
+        var dirs = DemoFileLocator.CandidateDirectories(Csgo, $"{Csgo}/MatchZy/2026-09-24_20-57-56_9_0.dem", "MatchZy/");
+        string recorded = $"{Csgo}/addons/metamod/MatchZy/2026-09-24_20-57-56_9_0.dem";
+        var logs = new List<string>();
+        string? found = DemoFileLocator.Resolve(
+            $"{Csgo}/MatchZy/2026-09-24_20-57-56_9_0.dem", dirs, 9, null, null,
+            path => path == recorded,
+            dir => dir == $"{Csgo}/addons/metamod/MatchZy"
+                ? new[] { new DemoFileCandidate(recorded, Start) }
+                : Array.Empty<DemoFileCandidate>(),
+            logs.Add);
+        Assert.Equal(recorded, found);
+    }
+
+    [Theory]
+    [InlineData("/home/container/game", "MatchZy/", "a.dem", "/home/container/game/csgo/MatchZy/a.dem")]
+    [InlineData("/home/container/game/", "MatchZy", "a.dem", "/home/container/game/csgo/MatchZy/a.dem")]
+    [InlineData("/srv/game", "", "a.dem", "/srv/game/csgo/a.dem")]
+    [InlineData("/srv/game", "/demos/sub/", "a.dem", "/srv/game/csgo/demos/sub/a.dem")]
+    [InlineData("C:\\cs2\\game", "MatchZy\\", "a.dem", "C:/cs2/game/csgo/MatchZy/a.dem")]
+    public void TvRecordPathIsAbsoluteWithForwardSlashes(string game, string demoPath, string file, string expected)
+    {
+        Assert.Equal(expected, DemoFileLocator.TvRecordPath(game, demoPath, file));
+    }
+
+    [Theory]
+    [InlineData("/home/container/game/csgo/MatchZy/a.dem", "/home/container/game/csgo/MatchZy/a.dem")]
+    [InlineData("C:/Program Files (x86)/Steam/game/csgo/MatchZy/a.dem", "\"C:/Program Files (x86)/Steam/game/csgo/MatchZy/a.dem\"")]
+    public void TvRecordArgumentQuotesOnlyPathsWithSpaces(string path, string expected)
+    {
+        Assert.Equal(expected, DemoFileLocator.TvRecordArgument(path));
     }
 
     [Fact]
@@ -113,5 +166,36 @@ public class DemoFileLocatorTests
         string? result = DemoFileLocator.Resolve($"{Csgo}/MatchZy/x_62_de_dust2.dem", new[] { Csgo }, 62, "de_dust2", Start,
             _ => false, _ => Array.Empty<DemoFileCandidate>(), _ => { });
         Assert.Null(result);
+    }
+
+    // Since the CS2 update of 2026-09-22 the engine writes mp_backup_round_file backups to the
+    // first Game search path, csgo/addons/metamod on a Metamod server; older builds wrote csgo/.
+    [Fact]
+    public void EngineWriteCandidatesAreCsgoThenMetamod()
+    {
+        Assert.Equal(
+            new[] { $"{Csgo}/matchzy_26_0_round07.txt", $"{Csgo}/addons/metamod/matchzy_26_0_round07.txt" },
+            DemoFileLocator.EngineWriteCandidates(Csgo, "matchzy_26_0_round07.txt"));
+    }
+
+    [Fact]
+    public void FindEngineFilePrefersCsgoWhenBothExist()
+    {
+        string? found = DemoFileLocator.FindEngineFile(Csgo, "matchzy_26_0_round07.txt", _ => true);
+        Assert.Equal($"{Csgo}/matchzy_26_0_round07.txt", found);
+    }
+
+    [Fact]
+    public void FindEngineFileFallsBackToMetamod()
+    {
+        string metamod = $"{Csgo}/addons/metamod/matchzy_26_0_round07.txt";
+        string? found = DemoFileLocator.FindEngineFile(Csgo, "matchzy_26_0_round07.txt", path => path == metamod);
+        Assert.Equal(metamod, found);
+    }
+
+    [Fact]
+    public void FindEngineFileIsNullWhenNeitherExists()
+    {
+        Assert.Null(DemoFileLocator.FindEngineFile(Csgo, "matchzy_26_0_round07.txt", _ => false));
     }
 }
