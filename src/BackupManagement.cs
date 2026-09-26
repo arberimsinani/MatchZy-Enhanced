@@ -351,8 +351,13 @@ namespace MatchZy
                     {
                         tempFileName = $"matchzy_{liveMatchId}_{matchConfig.CurrentMapNumber}_round{roundNumber}.txt";
                     }
-                    string tempFilePath = Path.Combine(Server.GameDirectory, "csgo", tempFileName);
-
+                    // The engine wrote the round backup to csgo/ or, since the CS2 update of
+                    // 2026-09-22 on a Metamod server, to csgo/addons/metamod/. Use the one that
+                    // exists; only when neither does is the copy from our JSON written to csgo/,
+                    // which mp_backup_restore_load_file finds through the search paths.
+                    string csgoDirectory = Path.Combine(Server.GameDirectory, "csgo");
+                    string tempFilePath = DemoFileLocator.FindEngineFile(csgoDirectory, tempFileName, File.Exists)
+                        ?? Path.Combine(csgoDirectory, tempFileName);
 
                     if (!File.Exists(tempFilePath))
                     {
@@ -429,11 +434,15 @@ namespace MatchZy
                 }
 
                 var gameRules = Utilities.FindAllEntitiesByDesignerName<CCSGameRulesProxy>("cs_gamerules").First().GameRules!;
-                string lastBackupFilePath = $"matchzy_{liveMatchId}_{matchConfig.CurrentMapNumber}_round{round}.txt"; ;
-                bool lastBackupExists = File.Exists(Path.Combine(Server.GameDirectory, "csgo", lastBackupFilePath));
-                lastBackupFilePath = Path.Combine(Server.GameDirectory, "csgo", lastBackupFilePath);
+                string lastBackupFileName = $"matchzy_{liveMatchId}_{matchConfig.CurrentMapNumber}_round{round}.txt";
+                // csgo/ or csgo/addons/metamod/, wherever the engine put it (see DemoFileLocator.EngineWriteCandidates).
+                string? lastBackupFilePath = DemoFileLocator.FindEngineFile(Path.Combine(Server.GameDirectory, "csgo"), lastBackupFileName, File.Exists);
+                if (lastBackupFilePath == null)
+                {
+                    Log($"[WriteBackup] Valve round backup {lastBackupFileName} not found in csgo/ or csgo/addons/metamod/; storing an empty valve_backup.");
+                }
 
-                string valveBackupContent = lastBackupExists ? File.ReadAllText(lastBackupFilePath) : "";
+                string valveBackupContent = lastBackupFilePath != null ? File.ReadAllText(lastBackupFilePath) : "";
 
                 Dictionary<string, string> roundData = new()
                     {
@@ -471,7 +480,7 @@ namespace MatchZy
                 File.WriteAllText(filePath, defaultJson);
 
                 Task.Run(async () => {
-                    await UploadFileAsync(filePath, backupUploadURL, backupUploadHeaderKey, backupUploadHeaderValue, liveMatchId, matchConfig.CurrentMapNumber, roundNumber);
+                    await UploadFileAsync(filePath, backupUploadURL, backupUploadHeaderKey, backupUploadHeaderValue, liveMatchId, matchConfig.CurrentMapNumber, roundNumber, isDemo: false);
                 });
 
             }

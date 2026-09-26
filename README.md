@@ -281,3 +281,19 @@ changes below on top, each written to be offered upstream.
   team as its winner and lets the normal match-end path run: series score,
   clinch, demo and map change. `css_endmatch` drops the whole loaded series;
   this ends one map of it. Admin or console/RCON only; needs a live map.
+- **Demos are recorded again after the CS2 update of 2026-09-22.** Since that
+  update a relative path given to `tv_record` lands in the first `Game` search
+  path of `gameinfo.gi`, which on a Metamod server is `csgo/addons/metamod/`.
+  `tv_record MatchZy/<name>.dem` therefore tried to open a file in a directory
+  that does not exist, the engine wrote nothing and said so only on the
+  console, and the plugin found out at upload time (`file_not_found`). Ported
+  from upstream's 1.4.35 hotfix: `tv_record` gets the absolute
+  `<game>/csgo/<demo path><name>`, the demo name is built from ASCII letters,
+  digits, `-`, `_` and `.` only (workshop map names and team names with `/ ; "`
+  or symbols broke the path or the console command, and non-ASCII names could
+  never be uploaded), and the upload's fallback search also looks under
+  `csgo/addons/metamod/`, so demos older builds recorded there are still
+  found. The engine's round backups (`mp_backup_round_file`) moved the same
+  way and take a prefix rather than a path, so the plugin now reads the Valve
+  backup from whichever of `csgo/` and `csgo/addons/metamod/` holds it instead
+  of storing an empty `valve_backup`.
